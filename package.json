@@ -1,0 +1,22 @@
+{
+  "name": "restep-server",
+  "version": "0.1.0",
+  "description": "Biblioteca de servidor para APIs Restep 1: tú escribes el acceso a los datos",
+  "license": "MIT",
+  "type": "module",
+  "exports": "./restep-server.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/restep-spec/restep-server.git"
+  },
+  "homepage": "https://restep.wubytes.com/tools/",
+  "bugs": {
+    "url": "https://github.com/restep-spec/restep-server/issues"
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  }
+}
