@@ -3,6 +3,11 @@
   "version": "0.2.0",
   "description": "Biblioteca de servidor para APIs Restep 1: tú escribes el acceso a los datos",
   "license": "MIT",
+  "files": [
+    "restep-server.mjs",
+    "pg.mjs",
+    "README.md"
+  ],
   "type": "module",
   "exports": {
     ".": "./restep-server.mjs",
