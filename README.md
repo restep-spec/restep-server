@@ -8,6 +8,10 @@ El núcleo solo usa la Web estándar (`Request`, `Response`, `URL`, Web Crypto):
 `createRestep(...)` devuelve `handle(request) => Promise<Response>`, que funciona igual en Node,
 Deno, Bun o Cloudflare Workers. Para Node http, Express y Hono hay adaptadores finos.
 
+```bash
+npm install restep-server
+```
+
 ## Ejemplo mínimo
 
 ```js
@@ -41,7 +45,7 @@ un singleton y oauth opcional, está en [`example-api.mjs`](example-api.mjs) (lo
 
 ```bash
 PORT=8810 node tools/restep-server/example.mjs
-node vendor/restep-check.mjs http://localhost:8810/ --writes      # 0 failed
+npx restep-check http://localhost:8810/ --writes      # 0 failed
 ```
 
 ## Qué haces tú: el adaptador de datos
