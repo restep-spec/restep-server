@@ -1,6 +1,6 @@
 // Definición de la API de ejemplo (la librería El Marcapáginas), sin servidor: la usan example.mjs
 // (Node) y la demo publicada en un Worker (projects/restep-demo).
-import { createRestep, memoryAdapter, t } from './restep-server.mjs';
+import { createRestep, memoryAdapter, memorySingleton, t } from './restep-server.mjs';
 
 export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...more } = {}) {
   return createRestep({
@@ -14,14 +14,35 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
     collections: {
       books: {
         description: t('Books in the catalogue of El Marcapáginas, one per edition.', 'Libros del catálogo de El Marcapáginas, uno por edición.'),
+        // title, default, examples y labels guían el formulario de alta (4.3); el orden de los campos es el suyo.
         fields: {
-          title: { type: 'string', required: true }, price: { type: 'decimal', required: true },
-          rating: 'number', year: 'integer', published: 'date', reading_time: 'duration', signed: 'boolean',
-          category: { type: 'enum', values: ['novela-negra', 'ciencia-ficcion', 'ensayo', 'poesia', 'infantil'] },
+          title: { type: 'string', required: true, title: t('Title', 'Título'), examples: ['La niebla de Portugalete'] },
+          price: { type: 'decimal', required: true, title: t('Price', 'Precio'), description: t('In euros, such as "18.50".', 'En euros, como "18.50".') },
+          category: { type: 'enum', values: ['novela-negra', 'ciencia-ficcion', 'ensayo', 'poesia', 'infantil'], default: 'novela-negra',
+            title: t('Category', 'Categoría'), labels: { 'novela-negra': t('Crime', 'Novela negra'), 'ciencia-ficcion': t('Science fiction', 'Ciencia ficción'),
+              ensayo: t('Essay', 'Ensayo'), poesia: t('Poetry', 'Poesía'), infantil: t('Children', 'Infantil') } },
+          year: { type: 'integer', title: t('Year', 'Año') },
+          published: { type: 'date', title: t('Published', 'Publicado') },
+          reading_time: { type: 'duration', title: t('Reading time', 'Tiempo de lectura'), examples: ['PT6H'] },
+          rating: { type: 'number', title: t('Rating', 'Valoración') },
+          signed: { type: 'boolean', default: false, title: t('Signed by the author', 'Firmado por el autor') },
+        },
+        // 11.1: GET /books:new da el cuerpo de un alta con lo que depende del momento: hoy y este año.
+        newItem: () => {
+          const today = new Date().toISOString().slice(0, 10);
+          return { year: Number(today.slice(0, 4)), published: today };
         },
         filter: { id: ['eq', 'in'], price: ['eq', 'lt', 'le', 'gt', 'ge'], category: ['eq', 'ne', 'in'],
           year: ['eq', 'lt', 'le', 'gt', 'ge'], rating: ['ge', 'null'], published: ['lt', 'ge'],
           reading_time: ['le', 'gt'], signed: ['eq', 'null'] },
+        // 6.1: filtros con nombre, para lo que no es comparar un campo. apply lo usa memoryAdapter;
+        // un adaptador propio recibe { named, value } y lo traduce a su consulta.
+        namedFilters: {
+          bargain: { description: t('Under 15 euros and rated 4 or more.', 'Por debajo de 15 euros y con un 4 o más.'),
+            apply: (r) => Number(r.price) < 15 && (r.rating ?? 0) >= 4 },
+          search: { type: 'string', description: t('Title contains the text, case-insensitively.', 'El título contiene el texto, sin distinguir mayúsculas.'),
+            apply: (r, v) => r.title.toLowerCase().includes(v.toLowerCase()) },
+        },
         sort: ['id', 'title', 'price', 'rating', 'year', 'published'],
         maxLimit: 50, count: 'exact',
         data: memoryAdapter([
@@ -58,6 +79,10 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
         fields: { name: { type: 'string', required: true }, note: 'string', parent: { type: 'relation', to: 'categories' } },
         filter: { id: ['eq', 'in'], name: ['eq'], 'parent.id': ['eq', 'null'] },
         sort: ['id', 'name'],
+        // 5.1: el cliente puede elegir el id (o dejar que lo asigne el servidor); los id usados no vuelven.
+        idFrom: 'either',
+        // 6.1: el nombre se filtra y ordena sin distinguir mayúsculas ni acentos.
+        collations: { name: 'server' },
         // Una regla propia de la API: una categoría no puede ser su propia antecesora.
         validate: async (row, ctx) => {
           const id = ctx.current?.id;
@@ -74,6 +99,15 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
           { id: '4', name: 'Libros infantiles', parent: { id: '2' } },
           { id: '5', name: 'Lámparas', parent: { id: '1' } },
         ]),
+      },
+    },
+    // 5.9: un singleton, los datos de la tienda.
+    singletons: {
+      shop: {
+        description: t('The shop’s own details.', 'Los datos de la propia tienda.'),
+        fields: { name: { type: 'string', required: true }, city: 'string', opening_hours: 'string',
+          featured: { type: 'relation', to: 'categories', description: t('The category on the shop window.', 'La categoría del escaparate.') } },
+        data: memorySingleton({ name: 'El Marcapáginas', city: 'Bilbao', opening_hours: 'L-S 10:00-20:00', featured: { id: '2' } }),
       },
     },
     ...more,

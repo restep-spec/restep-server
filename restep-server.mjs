@@ -1,7 +1,7 @@
-// restep-server · Biblioteca de servidor para Restep 1 (borrador 4): https://restep.wubytes.com/1/
+// restep-server · Biblioteca de servidor para Restep 1 (borrador 6, "restep": "1.0-draft.6"): https://restep.wubytes.com/1/
 // Hace la parte difícil del protocolo (descubrimiento, parámetros, errores, Merge Patch, ETag,
 // Idempotency-Key, caché, idioma) y deja al usuario solo el acceso a sus datos: un adaptador con
-// list, get, create, update y delete por colección.
+// list, get, create, update y delete por colección (y get y update por singleton).
 //
 // El núcleo solo usa la Web estándar (Request, Response, URL, Web Crypto), así que funciona igual en
 // Node 18+, Deno, Bun o Cloudflare Workers. Los adaptadores de Node http y Express están al final.
@@ -12,7 +12,13 @@
 
 const webcrypto = globalThis.crypto?.subtle ? globalThis.crypto : (await import('node:crypto')).webcrypto;
 
-const SPEC = 'https://restep.wubytes.com/1/';
+const PROFILE = 'https://w3id.org/restep/1/'; // identificador: enlace de perfil y tipos de error
+const RESTEP = '1.0-draft.6'; // 1.1: un borrador se declara con su sufijo
+// 3: gramática de los nombres que declara el descubrimiento (colecciones, campos, filtros, acciones, reasons…).
+export const NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+// 3: un id son caracteres no reservados del RFC 3986, ni "." ni "..".
+const isId = (v) => typeof v === 'string' && /^[A-Za-z0-9\-._~]+$/.test(v) && v !== '.' && v !== '..';
+const COLLATIONS = ['codepoint', 'server'];
 const RESERVED = ['filter', 'sort', 'fields', 'include', 'count', 'limit', 'cursor', 'since', 'languages'];
 const SCALARS = ['string', 'integer', 'number', 'decimal', 'boolean', 'date', 'datetime', 'duration', 'enum'];
 const OPS = ['eq', 'ne', 'lt', 'le', 'gt', 'ge', 'in', 'null'];
@@ -62,6 +68,9 @@ export const LANGUAGE_TAG = new RegExp('^(?:(?:[a-z]{2,3}(?:-[a-z]{3}){0,3}|[a-z
 // detail (y el detail de cada entrada de errors) puede ser un texto t(en, es).
 export class RestepError extends Error {
   constructor(status, code, detail, { headers = {}, ...extra } = {}) {
+    // 5.4: un reason sigue la gramática de los nombres; uno que no la cumple es un error de programación (500).
+    if (extra.reason !== undefined && (typeof extra.reason !== 'string' || !NAME.test(extra.reason)))
+      throw new Error(`restep-server: reason ${JSON.stringify(extra.reason)} no cumple la gramática de los nombres (3)`);
     super(text(detail, 'en') ?? code);
     Object.assign(this, { status, code, detail, extra, headers });
   }
@@ -81,6 +90,10 @@ const unsupported = (parameter, detail = t(`This resource does not support ${par
 const invalid = (errors, detail = t('Invalid data.', 'Datos no válidos.')) => new RestepError(422, 'invalid', detail, { errors });
 const once = (key) => bad(key, t(`Send ${key} once.`, `Envía ${key} una sola vez.`));
 const notFound = (path) => new RestepError(404, 'not_found', t(`${path} does not exist.`, `${path} no existe.`));
+// 5.1: un id que la colección tiene o tuvo. Igual tanto si el cliente puede ver ese elemento como si no.
+// Lánzalo desde el create de un adaptador propio cuando su clave primaria rechace el id.
+export const takenError = () => new RestepError(409, 'conflict', t('That id is taken.', 'Ese id ya está cogido.'),
+  { errors: [{ pointer: '/id', code: 'taken', detail: t('An item of this collection has or had this id.', 'Un elemento de esta colección tiene o tuvo este id.') }] });
 
 // ── Tipos y comparación (3, 6.1) ──────────────────────────────────────────────
 export const DECIMAL = /^-?\d+(\.\d+)?$/;
@@ -122,8 +135,13 @@ function seconds(v) { // longitud de una duración sin años ni meses; un día c
   const n = (i) => Number(m[i] ?? 0);
   return n(1) * 365 * DAY + n(2) * 30 * DAY + n(3) * 7 * DAY + n(4) * DAY + n(5) * 3600 + n(6) * 60 + n(7);
 }
+// La colación "server" de memoryAdapter (6.1): sin distinguir mayúsculas ni acentos. Es total y
+// determinista, y su igualdad es la de su orden (compare da 0 exactamente cuando son iguales).
+const serverCollator = new Intl.Collator('und', { sensitivity: 'base' });
 // Compara dos valores de un mismo tipo del descubrimiento (6.1). Para usarla en un adaptador propio.
-export function compareValues(type, a, b) {
+// collation: la de collations para ese campo; "server" compara texto con serverCollator, cualquier otra por puntos de código.
+export function compareValues(type, a, b, collation) {
+  if (collation === 'server' && (type === 'string' || type === undefined)) return serverCollator.compare(String(a), String(b));
   switch (type) {
     case 'decimal': return cmpDecimal(String(a), String(b));
     case 'integer': case 'number': return a - b;
@@ -149,20 +167,25 @@ export const valueAt = (row, path) => {
 };
 const COMPARE = { eq: (c) => c === 0, ne: (c) => c !== 0, lt: (c) => c < 0, le: (c) => c <= 0, gt: (c) => c > 0, ge: (c) => c >= 0 };
 // ¿Cumple row el filtro { field, op, value, type }? Salvo null, ningún operador casa con un valor ausente o null.
-export function matches(row, { field, op, value, type }) {
+// Un filtro con nombre (6.1) llega como { named, value, apply } y lo decide su apply (row, value) => boolean.
+export function matches(row, { field, op, value, type, collation, named, apply }) {
+  if (named !== undefined) {
+    if (typeof apply !== 'function') throw new Error(`El filtro con nombre ${named} necesita apply para filtrar en memoria; un adaptador propio lo traduce por su nombre`);
+    return !!apply(row, value);
+  }
   const v = valueAt(row, field);
   if (op === 'null') return (v === undefined || v === null) === value;
   if (v === undefined || v === null) return false;
-  if (op === 'in') return value.some((x) => compareValues(type, v, x) === 0);
-  return COMPARE[op](compareValues(type, v, value));
+  if (op === 'in') return value.some((x) => compareValues(type, v, x, collation) === 0);
+  return COMPARE[op](compareValues(type, v, value, collation));
 }
-// Ordena por [{ field, desc, type }]; los valores ausentes van al final en los dos sentidos.
+// Ordena por [{ field, desc, type, collation }]; los valores ausentes van al final en los dos sentidos.
 export function sorter(sort) {
   return (a, b) => {
-    for (const { field, desc, type } of sort) {
+    for (const { field, desc, type, collation } of sort) {
       const x = valueAt(a, field), y = valueAt(b, field);
       if (x == null || y == null) { if (x == null && y == null) continue; return x == null ? 1 : -1; }
-      const d = compareValues(type, x, y) * (desc ? -1 : 1);
+      const d = compareValues(type, x, y, collation) * (desc ? -1 : 1);
       if (d) return d;
     }
     return 0;
@@ -174,12 +197,16 @@ export function sorter(sort) {
 // list y get); los que faltan quitan su método HTTP de la colección.
 //   list({ filter, sort, limit, cursor, count }, ctx) → { items, next, total }
 //   get(id, ctx) → item | null;  create(data, ctx) → item;  update(id, data, ctx) → item;  delete(id, ctx)
+//   taken(id, ctx) → boolean: si el id lo tiene o lo tuvo un elemento (5.1), para id_from "client" o "either"
 export function memoryAdapter(initial = [], { generateId } = {}) {
   const rows = new Map(initial.map((r) => [String(r.id), structuredClone({ ...r, id: String(r.id) })]));
+  // 5.1: los id que ha tenido la colección, también los de elementos borrados: nunca se reutilizan.
+  const used = new Set(rows.keys());
   let counter = Math.max(0, ...[...rows.keys()].map(Number).filter(Number.isInteger)) + 1;
-  const newId = generateId ?? (() => { while (rows.has(String(counter))) counter++; return String(counter++); });
+  const newId = generateId ?? (() => { while (used.has(String(counter))) counter++; return String(counter++); });
   return {
     rows,
+    async taken(id) { return used.has(id); },
     async list({ filter, sort, limit, cursor, count }) {
       const all = [...rows.values()].filter((r) => filter.every((f) => matches(r, f))).sort(sorter(sort));
       const offset = cursor ?? 0; // el cursor de este adaptador es un desplazamiento; la biblioteca lo firma
@@ -190,18 +217,36 @@ export function memoryAdapter(initial = [], { generateId } = {}) {
       };
     },
     async get(id) { return rows.has(id) ? structuredClone(rows.get(id)) : null; },
-    async create(data) { const id = newId(); rows.set(id, structuredClone({ id, ...data })); return structuredClone(rows.get(id)); },
+    // data.id llega si el cliente lo eligió (id_from); si no, se asigna uno que la colección no haya tenido.
+    async create(data) {
+      const id = data.id ?? newId();
+      if (used.has(id)) throw takenError();
+      used.add(id);
+      rows.set(id, structuredClone({ ...data, id }));
+      return structuredClone(rows.get(id));
+    },
     async update(id, data) { rows.set(id, structuredClone({ ...data, id })); return structuredClone(rows.get(id)); },
     async delete(id) { rows.delete(id); },
+  };
+}
+
+// Un singleton en memoria (5.9), para pruebas y ejemplos: get(ctx) → objeto; update(data, ctx) → objeto.
+export function memorySingleton(initial = {}) {
+  let value = structuredClone(initial);
+  return {
+    async get() { return structuredClone(value); },
+    async update(data) { value = structuredClone(data); return structuredClone(value); },
   };
 }
 
 // Almacén de claves de idempotencia en memoria (7.1). En producción, uno duradero con la misma forma:
 // reserve(key, print, ttlMs) debe ser atómico (como SET NX): devuelve la entrada que ya había
 // ({ print, response? }; sin response, la primera sigue en curso) o null tras reservarla.
+// Pending outcomes must not expire into retries. Recover them before releasing a key.
+// Custom stores receive ctx last; use ctx.transaction when createTransaction is configured.
 export function memoryIdempotencyStore() {
   const map = new Map();
-  const live = (key) => { const e = map.get(key); if (e && e.expires <= Date.now()) { map.delete(key); return undefined; } return e; };
+  const live = (key) => { const e = map.get(key); if (e?.response && e.expires <= Date.now()) { map.delete(key); return undefined; } return e; };
   return {
     reserve(key, print, ttl) {
       const e = live(key);
@@ -230,6 +275,21 @@ const sfString = (s) => `"${s.replace(/[\\"]/g, '\\$&')}"`;
 const tags = (h) => (h ?? '').split(',').map((x) => x.trim()).filter(Boolean);
 const strongMatch = (h, tag) => tags(h).some((x) => x === '*' || (!x.startsWith('W/') && x === tag));
 const weakMatch = (h, tag) => tags(h).some((x) => x === '*' || x.replace(/^W\//, '') === tag);
+// 3: el tipo de un cuerpo, sin distinguir mayúsculas. charset solo puede ser utf-8, entre comillas o no y
+// en cualquier caja; los demás parámetros se ignoran. Sin Content-Type, ni siquiera vacío, no vale.
+function mediaTypeOk(header, types) {
+  if (header === null) return false;
+  const [type, ...params] = header.split(';');
+  if (!types.includes(type.trim().toLowerCase())) return false;
+  for (const p of params) {
+    const eq = p.indexOf('=');
+    if (eq < 0 || p.slice(0, eq).trim().toLowerCase() !== 'charset') continue;
+    let value = p.slice(eq + 1).trim();
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1).replace(/\\(.)/g, '$1');
+    if (value.toLowerCase() !== 'utf-8') return false;
+  }
+  return true;
+}
 const baseName = (k) => k.replace(/\[.*$/, '');
 const isReserved = (b) => RESERVED.includes(b) || b.startsWith('$');
 // RFC 7396, apartado 2
@@ -247,23 +307,41 @@ function normalizeField(name, f, cname) {
   if (![...SCALARS, 'map', 'relation'].includes(d.type)) throw configError(`${cname}.fields.${name}: tipo desconocido ${d.type}`);
   if (d.type === 'enum' && (!Array.isArray(d.values) || !d.values.length)) throw configError(`${cname}.fields.${name}: un enum necesita values`);
   if (d.type === 'relation' && typeof d.to !== 'string') throw configError(`${cname}.fields.${name}: una relación necesita to`);
-  if (name.startsWith('_') || name.includes('.')) throw configError(`${cname}.fields.${name}: un campo no puede empezar por _ ni llevar punto`);
+  // 3: los campos se declaran en los esquemas del descubrimiento, así que siguen la gramática de los nombres.
+  if (!NAME.test(name)) throw configError(`${cname}.fields.${name}: un campo sigue la gramática de los nombres (3): una letra y hasta 63 letras, dígitos, _ o -`);
+  // 4.3: default solo en escalares; el de un enum, uno de sus valores. labels: la etiqueta de cada valor del enum.
+  if ('default' in d && (d.type === 'map' || d.type === 'relation')) throw configError(`${cname}.fields.${name}: default solo en campos escalares`);
+  if ('default' in d && d.type === 'enum' && !d.values.includes(d.default)) throw configError(`${cname}.fields.${name}: default tiene que ser uno de values`);
+  if (d.labels !== undefined && (d.type !== 'enum' || typeof d.labels !== 'object' || d.values.some((v) => d.labels[v] == null)))
+    throw configError(`${cname}.fields.${name}: labels es para un enum y lleva una etiqueta por cada valor`);
+  if (d.examples !== undefined && !Array.isArray(d.examples)) throw configError(`${cname}.fields.${name}: examples es una lista`);
   return d;
 }
+const FIXED_PATH = /^(\/(?!\.\.?(?:\/|$))[A-Za-z0-9\-._~]+)+$/; // una ruta fija, sin plantillas, sin "/" final ni segmentos de puntos
 function normalizeCollection(name, def) {
+  if (!NAME.test(name)) throw configError(`${name}: el nombre de una colección sigue la gramática de los nombres (3)`);
   if (!def.data || typeof def.data.list !== 'function' || typeof def.data.get !== 'function')
     throw configError(`${name}: data tiene que ser un adaptador con list y get (por ejemplo memoryAdapter([...]))`);
   const fields = { id: { type: 'string' } };
   for (const [f, d] of Object.entries(def.fields ?? {})) if (f !== 'id') fields[f] = normalizeField(f, d, name);
   const c = {
     name, path: def.path ?? `/${name}`, description: def.description, fields, data: def.data,
-    filter: {}, sort: def.sort ?? [], defaultSort: def.defaultSort ?? ['id'],
+    filter: {}, namedFilters: {}, sort: def.sort ?? [], defaultSort: def.defaultSort ?? ['id'],
     maxLimit: def.maxLimit ?? 50, defaultLimit: def.defaultLimit ?? 20, count: def.count,
-    validate: def.validate, requireIfMatch: !!def.requireIfMatch, requireIdempotencyKey: !!def.requireIdempotencyKey,
+    validate: def.validate, newItem: def.newItem, requireIfMatch: !!def.requireIfMatch, requireIdempotencyKey: !!def.requireIdempotencyKey,
+    idFrom: def.idFrom, idPattern: def.idPattern, collations: def.collations,
     methods: ['GET', ...(def.data.create ? ['POST'] : [])],
     itemMethods: ['GET', ...(def.data.update ? ['PATCH'] : []), ...(def.data.delete ? ['DELETE'] : [])],
   };
-  if (!/^\/[A-Za-z0-9\-._~/]*[^/]$/.test(c.path) || c.path.includes('{')) throw configError(`${name}: path tiene que ser una ruta fija como /books (sin plantillas)`);
+  if (!FIXED_PATH.test(c.path)) throw configError(`${name}: path tiene que ser una ruta fija como /books (sin plantillas: esta biblioteca no hace subcolecciones)`);
+  // 5.1: quién elige el id. "client" y "either" necesitan saber qué id ha tenido la colección (taken).
+  if (c.idFrom !== undefined) {
+    if (!['server', 'client', 'either'].includes(c.idFrom)) throw configError(`${name}.idFrom: "server", "client" o "either"`);
+    if (c.idFrom !== 'server' && (typeof def.data.taken !== 'function' || !def.data.create))
+      throw configError(`${name}.idFrom: "${c.idFrom}" necesita un adaptador con create y taken(id, ctx), que diga si la colección tiene o tuvo ese id (5.1)`);
+  }
+  if (c.idPattern !== undefined && (c.idFrom ?? 'server') === 'server') throw configError(`${name}.idPattern: solo con idFrom "client" o "either"`);
+  if (c.idPattern !== undefined) { try { c.idRegExp = new RegExp(c.idPattern, 'u'); } catch { throw configError(`${name}.idPattern: no es una expresión regular`); } }
   c.typeOf = (p) => {
     const dot = p.indexOf('.');
     if (dot < 0) return fields[p]?.type === 'map' || fields[p]?.type === 'relation' ? undefined : fields[p]?.type;
@@ -278,12 +356,49 @@ function normalizeCollection(name, def) {
     if (!type) throw configError(`${name}.filter.${f}: no es un campo escalar, una traducción (campo.etiqueta) ni relación.id`);
     for (const op of ops) if (!OPS.includes(op)) throw configError(`${name}.filter.${f}: operador desconocido ${op}`);
     if (type === 'boolean' && ops.some((o) => !['eq', 'ne', 'null'].includes(o))) throw configError(`${name}.filter.${f}: un boolean solo admite eq, ne y null (6.1)`);
+    if (f === 'id' && ops.some((o) => ['lt', 'le', 'gt', 'ge'].includes(o))) throw configError(`${name}.filter.id: el orden de los id es del servidor; sin lt, le, gt ni ge (6.1)`);
     c.filter[f] = { ops, type, description: Array.isArray(d) ? undefined : d.description };
+  }
+  // 6.1: filtros con nombre. Sin type, un interruptor; con type, llevan un valor de ese tipo.
+  for (const [f, d] of Object.entries(def.namedFilters ?? {})) {
+    if (!d || typeof d !== 'object' || !d.description) throw configError(`${name}.namedFilters.${f}: necesita description, que es lo que dice qué elementos devuelve`);
+    if (!NAME.test(f)) throw configError(`${name}.namedFilters.${f}: un filtro con nombre sigue la gramática de los nombres (3)`);
+    if (Object.hasOwn(c.filter, f)) throw configError(`${name}.namedFilters.${f}: ya es una clave de filter (6.1)`);
+    if (d.type !== undefined && !SCALARS.includes(d.type)) throw configError(`${name}.namedFilters.${f}: tipo desconocido ${d.type}`);
+    if (d.type === 'enum' && (!Array.isArray(d.values) || !d.values.length)) throw configError(`${name}.namedFilters.${f}: un enum necesita values`);
+    if (d.apply !== undefined && typeof d.apply !== 'function') throw configError(`${name}.namedFilters.${f}: apply tiene que ser una función (fila, valor) => boolean`);
+    c.namedFilters[f] = { type: d.type, values: d.values, description: d.description, apply: d.apply };
   }
   for (const s of [...c.sort, ...c.defaultSort.map((x) => x.replace(/^-/, ''))])
     if (!c.typeOf(s)) throw configError(`${name}.sort: ${s} no es un campo escalar ni una traducción`);
+  // 6.1: collations, por campo de texto (o traducción campo.etiqueta) declarado en filter o en sort; nunca id.
+  if (c.collations !== undefined) {
+    if (!isObject(c.collations)) throw configError(`${name}.collations: un objeto { campo: "codepoint" | "server" }`);
+    for (const [f, v] of Object.entries(c.collations)) {
+      if (!COLLATIONS.includes(v)) throw configError(`${name}.collations.${f}: "codepoint" o "server"`);
+      if (f === 'id' || c.typeOf(f) !== 'string' || !(Object.hasOwn(c.filter, f) || c.sort.includes(f)))
+        throw configError(`${name}.collations.${f}: tiene que ser un campo string (o campo.etiqueta) declarado en filter o en sort, y no id`);
+    }
+  }
+  c.collationOf = (f) => c.collations?.[f] ?? 'codepoint';
   if (c.count && !['exact', 'estimated'].includes(c.count)) throw configError(`${name}.count: "exact" o "estimated"`);
+  if (c.newItem !== undefined && (typeof c.newItem !== 'function' || !def.data.create)) throw configError(`${name}.newItem: una función (ctx) => cuerpo, en una colección que admite POST`);
   return c;
+}
+// 5.9: un singleton, como /me: un elemento sin id ni colección. Su adaptador tiene get(ctx) y, para PATCH, update(data, ctx).
+function normalizeSingleton(name, def) {
+  if (!NAME.test(name)) throw configError(`singletons.${name}: el nombre sigue la gramática de los nombres (3)`);
+  if (!def?.data || typeof def.data.get !== 'function') throw configError(`singletons.${name}: data tiene que ser un adaptador con get(ctx) y, si admite PATCH, update(data, ctx)`);
+  const path = def.path ?? `/${name}`;
+  if (!FIXED_PATH.test(path)) throw configError(`singletons.${name}: path tiene que ser una ruta fija como /me (sin plantillas)`);
+  const fields = {};
+  for (const [f, d] of Object.entries(def.fields ?? {})) {
+    if (f === 'id') throw configError(`singletons.${name}.fields.id: esta biblioteca no da id a un singleton`);
+    fields[f] = normalizeField(f, d, `singletons.${name}`);
+    if (fields[f].type === 'map') throw configError(`singletons.${name}.fields.${f}: los mapas de idioma en un singleton quedan fuera de Restep 1 (5.9)`);
+  }
+  return { name, singleton: true, path, description: def.description, fields, data: def.data, validate: def.validate,
+    requireIfMatch: !!def.requireIfMatch, methods: ['GET', ...(def.data.update ? ['PATCH'] : [])] };
 }
 
 // ── createRestep ──────────────────────────────────────────────────────────────
@@ -291,8 +406,13 @@ export function createRestep(options) {
   const {
     collections: defs, base: rawBase = '', languages = LIBRARY_LANGUAGES, languageTags = null,
     idempotencyTtl = DAY, idempotencyStore = memoryIdempotencyStore(), secret, maxBodyBytes = 1 << 20,
-    status = null, oauth = null, authenticate = null, docs = null, cors = null, onError = (e) => console.error(e), version = '1',
+    createTransaction = null, status = null, oauth = null, authenticate = null, docs = null, cors = null, onError = (e) => console.error(e), version = '1',
+    singletons: singletonDefs = {}, idempotencyAnonymous = true, browserCredentials = oauth ? false : 'auto',
   } = options;
+  if (createTransaction !== null && typeof createTransaction !== 'function') throw configError('createTransaction must be a function');
+  if (typeof idempotencyAnonymous !== 'boolean') throw configError('idempotencyAnonymous: true o false (7.1)');
+  if (![true, false, 'auto'].includes(browserCredentials) && typeof browserCredentials !== 'function')
+    throw configError('browserCredentials: "auto", true, false o una función (request) => boolean (5.8)');
   const base = rawBase.replace(/\/$/, '');
   if (base && !/^\/[^?#]*$/.test(base)) throw configError('base tiene que empezar por / (como "/api")');
   if (!languages.length || languages.some((l) => !LIBRARY_LANGUAGES.includes(l))) throw configError(`languages: solo ${LIBRARY_LANGUAGES.join(', ')}`);
@@ -300,12 +420,23 @@ export function createRestep(options) {
   if (oauth && (!Array.isArray(oauth.authorizationServers) || !oauth.authorizationServers.length || typeof oauth.verifyToken !== 'function'))
     throw configError('oauth necesita authorizationServers (al menos uno) y verifyToken(token, request)');
   const colls = Object.fromEntries(Object.entries(defs).map(([n, d]) => [n, normalizeCollection(n, d)]));
-  for (const c of Object.values(colls)) for (const [f, d] of Object.entries(c.fields))
-    if (d.type === 'relation' && !colls[d.to]) throw configError(`${c.name}.fields.${f}: la colección ${d.to} no existe`);
-  const writable = Object.values(colls).some((c) => c.methods.length > 1 || c.itemMethods.length > 1);
-  const profiles = ['core', 'query', ...(writable ? ['writes'] : [])];
-  const extensions = oauth ? ['oauth'] : [];
-  const profileLink = [...profiles, ...extensions].map((p) => `<${SPEC}${p}>; rel="profile"`).join(', ');
+  const singles = Object.fromEntries(Object.entries(singletonDefs).map(([n, d]) => [n, normalizeSingleton(n, d)]));
+  for (const c of [...Object.values(colls), ...Object.values(singles)]) for (const [f, d] of Object.entries(c.fields))
+    if (d.type === 'relation' && !colls[d.to]) throw configError(`${c.singleton ? 'singletons.' : ''}${c.name}.fields.${f}: la colección ${d.to} no existe`);
+  // 5.9: la ruta de un singleton no es una que tenga o pueda tener una colección o uno de sus elementos.
+  for (const s of Object.values(singles)) {
+    const clash = Object.values(colls).find((c) => s.path === c.path || s.path.startsWith(`${c.path}/`))
+      ?? Object.values(singles).find((o) => o !== s && o.path === s.path);
+    if (clash) throw configError(`singletons.${s.name}: la ruta ${s.path} choca con ${clash.singleton ? 'el singleton' : 'la colección'} ${clash.name}`);
+  }
+  const writable = Object.values(colls).some((c) => c.methods.length > 1 || c.itemMethods.length > 1)
+    || Object.values(singles).some((s) => s.methods.length > 1);
+  // cache (8) solo pide core: Cache-Control en toda lectura, ETag del elemento, 304 y Cache-Groups, que la biblioteca da siempre.
+  const profiles = ['core', 'query', ...(writable ? ['writes'] : []), 'cache'];
+  // actions (11.1): solo la acción new, en las colecciones con newItem.
+  const extensions = [...(Object.values(colls).some((c) => c.newItem) ? ['actions'] : []), ...(oauth ? ['oauth'] : [])];
+  // 4.1: un único enlace de perfil, a la URI de la versión; qué se implementa lo dice el descubrimiento.
+  const profileLink = `<${PROFILE}>; rel="profile"`;
   // Documentación de la API (4.2, DEBERÍA): rel="service-doc" en la respuesta del descubrimiento.
   // docs: una URL o una lista de { href, hreflang, title }.
   const docsList = docs == null ? [] : (Array.isArray(docs) ? docs : [docs]).map((d) => (typeof d === 'string' ? { href: d } : d));
@@ -333,7 +464,7 @@ export function createRestep(options) {
   function problem(ctx, e) {
     const lang = ctx.lang;
     const extra = e.extra.errors ? { ...e.extra, errors: e.extra.errors.map((x) => ({ ...x, ...(x.detail != null && { detail: text(x.detail, lang) }) })) } : e.extra;
-    const body = { type: `${SPEC}errors#${e.code}`, title: text(TITLES[e.status] ?? 'Error', lang), status: e.status, code: e.code,
+    const body = { type: `${PROFILE}errors#${e.code}`, title: text(TITLES[e.status] ?? 'Error', lang), status: e.status, code: e.code,
       ...(e.detail != null && { detail: text(e.detail, lang) }), ...extra };
     const headers = { 'Cache-Control': 'no-store', Vary: 'Accept-Language', 'Content-Language': lang, ...e.headers };
     if (e.status === 401 && !Object.keys(e.headers).some((k) => k.toLowerCase() === 'www-authenticate')) headers['WWW-Authenticate'] = 'Bearer realm="restep"';
@@ -343,13 +474,15 @@ export function createRestep(options) {
   // ── Representaciones ──
   // Solo los campos declarados (más id y los miembros _ que dé el adaptador); un mapa de idioma sin
   // traducciones es {} (3); una relación que llega como id suelto se convierte en { id } (3).
+  // En un singleton no hay id, y cada relación lleva href, porque no declara relations (5.9).
   function represent(c, raw) {
-    const out = { id: String(raw.id) };
+    const out = c.singleton ? {} : { id: String(raw.id) };
     for (const [f, d] of Object.entries(c.fields)) {
       if (f === 'id') continue;
       let v = raw[f];
       if (d.type === 'map') v = isObject(v) ? v : {};
       else if (d.type === 'relation' && (typeof v === 'string' || typeof v === 'number')) v = { id: String(v) };
+      if (d.type === 'relation' && isObject(v)) v = c.singleton ? { id: String(v.id), href: itemPath(colls[d.to], String(v.id)) } : { id: String(v.id) };
       if (v !== undefined) out[f] = v;
     }
     for (const [k, v] of Object.entries(raw)) if (k.startsWith('_') && k !== '_etag') out[k] = v;
@@ -357,12 +490,14 @@ export function createRestep(options) {
   }
   const pick = (row, fields) => {
     if (!fields) return row;
-    const out = { id: row.id };
+    const out = 'id' in row ? { id: row.id } : {};
     for (const f of fields) if (f in row) out[f] = row[f];
     for (const [k, v] of Object.entries(row)) if (k.startsWith('_')) out[k] = v;
     return out;
   };
-  const itemPath = (c, id) => `${base}${c.path}/${id}`;
+  const itemPath = (c, id) => (c.singleton ? `${base}${c.path}` : `${base}${c.path}/${id}`);
+  // 7.2: con writes, toda respuesta cuyo cuerpo es un elemento lleva en _etag la ETag del elemento, calculada sin _etag.
+  const withEtag = async (row) => (writable ? { ...row, _etag: await etagOf(row) } : row);
   const groups = (paths) => paths.slice(0, 32).map(sfString).join(', ');
 
   // ── Descubrimiento (4.2) y esquemas (4.3) ──
@@ -379,19 +514,38 @@ export function createRestep(options) {
           additionalProperties: { type: kind === 'update' ? ['string', 'null'] : 'string' },
           description: text(t('Translations, by language tag in lowercase, such as {"en": "…", "es-mx": "…"}.',
             'Traducciones, por etiqueta de idioma en minúsculas, como {"en": "…", "es-mx": "…"}.'), lang) }
-        : d.type === 'relation' ? { type: 'object', required: ['id'], properties: { id: { type: 'string' } } }
+        : d.type === 'relation' ? { type: 'object', required: ['id'], properties: { id: { type: 'string' }, ...(c.singleton && { href: { type: 'string' } }) } }
         : { type: d.type };
-      if (d.description) s.description = text(d.description, lang);
+      // Un enum con labels: las opciones con su etiqueta, para un formulario (4.3).
+      if (d.type === 'enum' && d.labels) { delete s.enum; s.oneOf = d.values.map((v) => ({ const: v, title: text(d.labels[v], lang) })); }
       const nullable = d.type === 'map' ? kind === 'update' : !d.required;
-      return nullable ? { anyOf: [s, { type: 'null' }] } : s;
+      const out = nullable ? { anyOf: [s, { type: 'null' }] } : s;
+      // Las anotaciones de un formulario van en la propiedad, fuera del anyOf (4.3). default, solo en create.
+      if (d.title) out.title = text(d.title, lang);
+      if (d.description) out.description = text(d.description, lang);
+      if (kind === 'create' && 'default' in d) out.default = d.default;
+      if (d.examples) out.examples = d.examples;
+      return out;
     };
     const names = Object.keys(c.fields).filter((f) => f !== 'id');
     const props = (kind) => Object.fromEntries(names.map((f) => [f, json(f, kind)]));
     const required = names.filter((f) => c.fields[f].required);
+    const requiredCreate = required.filter((f) => !('default' in c.fields[f])); // con default, el POST puede no traerlo
     const reserved = { '^_': {} };
+    const ID_SOURCE = '^(?!\\.\\.?$)[A-Za-z0-9._~-]+$';
+    // 5.1: con id_from "client" o "either", el create admite id (y con "client" lo exige), con el formato que restringe idPattern.
+    const ownId = c.idFrom === 'client' || c.idFrom === 'either';
+    const idCreate = { type: 'string', pattern: ID_SOURCE, ...(c.idPattern && { allOf: [{ pattern: c.idPattern }] }) };
+    if (c.singleton) return {
+      item: { type: 'object', required, properties: props('item') },
+      ...(c.methods.includes('PATCH') && { update: { type: 'object',
+        description: text(t('A JSON Merge Patch: absent leaves a field untouched, null deletes it.', 'Un JSON Merge Patch: lo ausente no cambia, null lo borra.'), lang),
+        properties: props('update'), patternProperties: reserved, additionalProperties: false } }),
+    };
     return {
       item: { type: 'object', required: ['id', ...required], properties: { id: { type: 'string', readOnly: true }, ...props('item') } },
-      ...(c.methods.includes('POST') && { create: { type: 'object', required, properties: props('create'), patternProperties: reserved, additionalProperties: false } }),
+      ...(c.methods.includes('POST') && { create: { type: 'object', required: [...(c.idFrom === 'client' ? ['id'] : []), ...requiredCreate],
+        properties: { ...(ownId && { id: idCreate }), ...props('create') }, patternProperties: reserved, additionalProperties: false } }),
       ...(c.itemMethods.includes('PATCH') && { update: { type: 'object',
         description: text(t('A JSON Merge Patch: absent leaves a field untouched, null deletes it.', 'Un JSON Merge Patch: lo ausente no cambia, null lo borra.'), lang),
         properties: { id: { type: 'string' }, ...props('update') }, patternProperties: reserved, additionalProperties: false } }),
@@ -403,19 +557,28 @@ export function createRestep(options) {
       return [c.name, {
         path: c.path,
         ...(c.description && { description: text(c.description, lang) }),
-        methods: c.methods, item_methods: c.itemMethods, schemas: schemas(c, lang),
+        methods: c.methods, item_methods: c.itemMethods, ...(c.idFrom && { id_from: c.idFrom }), schemas: schemas(c, lang),
         filter: Object.fromEntries(Object.entries(c.filter).map(([f, d]) => [f, {
           type: d.type, ...(d.type === 'enum' && { values: c.fields[f].values }), ops: d.ops,
           ...(d.description && { description: text(d.description, lang) }) }])),
-        sort: c.sort, max_limit: c.maxLimit, ...(c.count && { count: c.count }),
+        ...(Object.keys(c.namedFilters).length && { named_filters: Object.fromEntries(Object.entries(c.namedFilters).map(([f, d]) => [f, {
+          ...(d.type && { type: d.type }), ...(d.type === 'enum' && { values: d.values }), description: text(d.description, lang) }])) }),
+        sort: c.sort, ...(c.collations && Object.keys(c.collations).length && { collations: c.collations }),
+        max_limit: c.maxLimit, ...(c.count && { count: c.count }),
+        ...(c.newItem && { actions: { new: { on: 'collection', safe: true, idempotent: true, method: 'GET',
+          description: text(t('The body of a POST already filled in for this client, to start a form; it creates nothing.',
+            'El cuerpo de un POST ya relleno para este cliente, para empezar un formulario; no crea nada.'), lang) } } }),
         ...(maps(c).length && { language_maps: Object.fromEntries(maps(c).map((f) => [f, {}])) }),
         ...(rels.length && { relations: Object.fromEntries(rels.map((r) => [r, { to: c.fields[r].to,
           ...(c.fields[r].description && { description: text(c.fields[r].description, lang) }) }])) }),
       }];
     }));
-    return { restep: '1.0', version, profiles, extensions,
-      ...(writable && { idempotency: { ttl: idempotencyTtl } }),
-      ...(statusPath && { status: statusPath }), collections };
+    const singletons = Object.fromEntries(Object.values(singles).map((s) => [s.name, {
+      path: s.path, methods: s.methods, ...(s.description && { description: text(s.description, lang) }), schemas: schemas(s, lang) }]));
+    // 4.2: el mismo documento para todos los principales; solo cambian sus textos, con Accept-Language.
+    return { restep: RESTEP, version, profiles, extensions,
+      ...(writable && { idempotency: { ttl: idempotencyTtl, ...(!idempotencyAnonymous && { anonymous: false }) } }),
+      ...(statusPath && { status: statusPath }), collections, ...(Object.keys(singletons).length && { singletons }) };
   }
 
   // ── Autenticación ──
@@ -471,6 +634,15 @@ export function createRestep(options) {
       const m = key.match(/^filter\[([^\][]+)\](?:\[([^\][]+)\])?$/);
       if (!m) throw unsupported(key, t('This resource supports filter[field] and filter[field][op].', 'Este recurso admite filter[campo] y filter[campo][op].'));
       const [, field, op = 'eq'] = m;
+      if (Object.hasOwn(c.namedFilters, field)) { // 6.1: sin operadores; un interruptor sin valor, uno con type con un valor de su tipo
+        const n = c.namedFilters[field];
+        if (m[2] !== undefined) throw unsupported(key, t(`${field} is a named filter: it takes no operator.`, `${field} es un filtro con nombre: no lleva operador.`));
+        if (!n.type && value !== '') throw bad(key, t(`${field} is a switch: it takes no value.`, `${field} es un interruptor: no lleva valor.`));
+        if (n.type && value === '') throw bad(key, t(`${field} needs a ${n.type} value.`, `${field} necesita un valor ${n.type}.`));
+        const v = n.type ? parseValue({ fields: { [field]: { values: n.values } } }, field, n.type, value, key) : true;
+        out.push({ named: field, value: v, ...(n.apply && { apply: n.apply }) });
+        continue;
+      }
       const d = Object.hasOwn(c.filter, field) ? c.filter[field] : null;
       if (!d) throw unsupported(key, t(`There is no filter on ${field}. Filters: ${Object.keys(c.filter).join(', ') || 'none'}.`, `No hay filtro por ${field}. Filtros: ${Object.keys(c.filter).join(', ') || 'ninguno'}.`));
       if (!d.ops.includes(op)) throw unsupported(key, t(`${field} supports: ${d.ops.join(', ')}.`, `${field} admite: ${d.ops.join(', ')}.`));
@@ -485,7 +657,7 @@ export function createRestep(options) {
         if (parts.some((x) => x === '')) throw bad(key, t('in needs a non-empty, comma-separated list.', 'in necesita una lista no vacía, separada por comas.'));
         v = parts.map((x) => parseValue(c, field, d.type, x, key));
       } else v = parseValue(c, field, d.type, value, key);
-      out.push({ field, op, value: v, type: d.type });
+      out.push({ field, op, value: v, type: d.type, collation: c.collationOf(field) });
     }
     return out;
   }
@@ -532,9 +704,9 @@ export function createRestep(options) {
 
   // ── writes: cuerpos y validación (3, 5.1, 7) ──
   async function readBody(ctx, types) {
-    const type = (ctx.request.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
-    if (!types.includes(type))
-      throw new RestepError(415, 'unsupported_media_type', t(`Send ${types.join(' or ')}.`, `Envía ${types.join(' o ')}.`),
+    // 3: application/json (y, en un PATCH, application/merge-patch+json), en UTF-8; sin Content-Type, 415 aunque el cuerpo esté vacío.
+    if (!mediaTypeOk(ctx.request.headers.get('content-type'), types))
+      throw new RestepError(415, 'unsupported_media_type', t(`Send ${types.join(' or ')}, in UTF-8.`, `Envía ${types.join(' o ')}, en UTF-8.`),
         types.includes('application/merge-patch+json') ? { headers: { 'Accept-Patch': 'application/merge-patch+json' } } : {});
     const tooLarge = () => new RestepError(413, 'content_too_large', t(`The body may be up to ${maxBodyBytes} bytes.`, `El cuerpo puede tener hasta ${maxBodyBytes} bytes.`));
     if (Number(ctx.request.headers.get('content-length') ?? 0) > maxBodyBytes) throw tooLarge();
@@ -551,6 +723,8 @@ export function createRestep(options) {
     : d.type === 'boolean' ? typeof v === 'boolean' : d.type === 'date' ? typeof v === 'string' && isDate(v)
     : d.type === 'datetime' ? typeof v === 'string' && isDatetime(v) : d.type === 'duration' ? typeof v === 'string' && DURATION.test(v)
     : typeof v === 'string');
+  for (const c of Object.values(colls)) for (const [f, d] of Object.entries(c.fields))
+    if ('default' in d && !typeOk(d, d.default)) throw configError(`${c.name}.fields.${f}: default no es un ${d.type} válido`);
   // Valida los miembros de un cuerpo antes de fusionarlo. current: el elemento guardado (PATCH) o undefined (POST).
   async function bodyErrors(c, body, current, ctx) {
     const errors = [];
@@ -579,8 +753,12 @@ export function createRestep(options) {
       if (d.type === 'relation') {
         if (!isObject(v) || typeof v.id !== 'string') { errors.push({ pointer: ptr(f), code: 'type', detail: t(`${f} must be an object with an id, or null.`, `${f} tiene que ser un objeto con un id, o null.`) }); continue; }
         body[f] = { id: v.id }; // 5.1: solo se lee su id; nunca se modifica el elemento relacionado
-        if (!(await colls[d.to].data.get(v.id, { ...ctx, collection: colls[d.to] })))
-          errors.push({ pointer: ptr(f), code: 'unknown', detail: t(`There is no ${d.to} ${v.id}.`, `No hay ningún ${d.to} ${v.id}.`) });
+        // 5.1: con su valor actual se ignora sin comprobarla, así que devolver lo leído nunca falla por ella.
+        if (patch && current?.[f]?.id === v.id) continue;
+        // 5.1: un elemento que no existe y uno que el principal no puede ver dan la misma entrada (el get del
+        // adaptador devuelve null para los dos).
+        if (!isId(v.id) || !(await colls[d.to].data.get(v.id, { ...ctx, collection: colls[d.to] })))
+          errors.push({ pointer: `${ptr(f)}/id`, code: 'unknown', detail: t(`There is no ${d.to} ${v.id}.`, `No hay ningún ${d.to} ${v.id}.`) });
         continue;
       }
       if (!typeOk(d, v)) errors.push({ pointer: ptr(f), code: 'type', detail: t(`${f} must be a ${d.type}${d.type === 'decimal' ? ' in a string, such as "18.50"' : ''}.`, `${f} tiene que ser de tipo ${d.type}${d.type === 'decimal' ? ' en una cadena, como "18.50"' : ''}.`) });
@@ -611,7 +789,8 @@ export function createRestep(options) {
     return out;
   }
 
-  // Exclusión por elemento: evaluar If-Match y escribir es atómico dentro de este proceso (7.2).
+  // Exclusión por elemento: evaluar If-Match y escribir es atómico dentro de este proceso (7.2). Entre
+  // procesos lo hace la transacción de createTransaction con el get de forUpdate.
   const locks = new Map();
   async function withLock(key, fn) {
     const prev = locks.get(key) ?? Promise.resolve();
@@ -637,8 +816,8 @@ export function createRestep(options) {
   async function listCollection(c, ctx) {
     const params = ctx.url.searchParams;
     const filter = parseFilters(c, params);
-    const sort = parseSort(c, params).map((s) => ({ ...s, type: c.typeOf(s.field) }));
-    if (!sort.some((s) => s.field === 'id')) sort.push({ field: 'id', desc: false, type: 'string' }); // desempate estable (6.2)
+    const sort = parseSort(c, params).map((s) => ({ ...s, type: c.typeOf(s.field), collation: c.collationOf(s.field) }));
+    if (!sort.some((s) => s.field === 'id')) sort.push({ field: 'id', desc: false, type: 'string', collation: 'codepoint' }); // desempate estable (6.2)
     const rawLimit = params.get('limit');
     const limit = rawLimit === null ? Math.min(c.defaultLimit, c.maxLimit) : Number(rawLimit);
     if (rawLimit !== null && (!/^\d+$/.test(rawLimit) || limit < 1 || limit > c.maxLimit))
@@ -649,7 +828,10 @@ export function createRestep(options) {
     const fields = parseFields(c, params);
     const print = await queryPrint(c, params, ctx.principal);
     const cursor = await readCursor(params, print);
-    const page = await c.data.list({ filter, sort, limit, cursor, count: count === 'true', fields }, { ...ctx, collection: c });
+    // 7.2: si el elemento admite PATCH o DELETE, cada uno lleva en _etag la ETag de su GET, calculada
+    // sobre la representación completa; por eso el adaptador no recibe fields como pista en ese caso.
+    const itemEtag = c.itemMethods.length > 1;
+    const page = await c.data.list({ filter, sort, limit, cursor, count: count === 'true', fields: itemEtag ? null : fields }, { ...ctx, collection: c });
     if (count === 'true' && typeof page.total !== 'number') throw new Error(`restep-server: ${c.name}.data.list no ha devuelto total con count`);
     let next = null;
     if (page.next != null) {
@@ -657,33 +839,67 @@ export function createRestep(options) {
       q.set('cursor', await makeCursor(page.next, print));
       next = `${ctx.url.pathname}?${q}`;
     }
-    const items = page.items.map((r) => pick(represent(c, r), fields));
+    const items = await Promise.all(page.items.map(async (r) => {
+      const row = represent(c, r);
+      return itemEtag ? { ...pick(row, fields), _etag: await etagOf(row) } : pick(row, fields);
+    }));
     return { items, next, ...(count === 'true' && { total: page.total }), ...(count === 'true' && c.count === 'estimated' && { total_estimated: true }) };
   }
 
   async function collectionEtag(c, ctx) {
-    const page = await c.data.list({ filter: [], sort: [{ field: 'id', desc: false, type: 'string' }], limit: Math.min(c.defaultLimit, c.maxLimit), cursor: null, count: false, fields: null }, { ...ctx, collection: c });
-    return etagOf(page.items.map((r) => represent(c, r)));
+    // La misma ETag que un GET de la colección sin parámetros (con el _etag de cada elemento).
+    return etagOf(await listCollection(c, { ...ctx, url: new URL(`${base}${c.path}`, ctx.url) }));
+  }
+
+  // 7.1: la clave de la petición, ya comprobada; null si no trae. Una mal formada (o con parámetros) da 400 con su entrada.
+  function idempotencyKey(c, ctx) {
+    const raw = ctx.request.headers.get('idempotency-key');
+    const anonymous = ctx.principal == null;
+    if (raw === null) {
+      // Con "anonymous": false, un recurso que exige la clave no se la exige a una petición sin credenciales.
+      if (c.requireIdempotencyKey && !(anonymous && !idempotencyAnonymous))
+        throw new RestepError(400, 'idempotency_key_required', t('This collection requires Idempotency-Key.', 'Esta colección exige Idempotency-Key.'),
+          { errors: [{ header: 'Idempotency-Key', code: 'required', detail: t('Send Idempotency-Key.', 'Envía Idempotency-Key.') }] });
+      return null;
+    }
+    const m = raw.trim().match(/^"((?:[\x20\x21\x23-\x5b\x5d-\x7e]|\\["\\])*)"$/);
+    if (!m) throw new RestepError(400, 'bad_request', t('Idempotency-Key must be a quoted string without parameters, such as "8e03978e-40d5".', 'Idempotency-Key tiene que ser una cadena entre comillas y sin parámetros, como "8e03978e-40d5".'),
+      { errors: [{ header: 'Idempotency-Key', code: 'format', detail: t('Not a Structured Fields string without parameters.', 'No es una cadena de Structured Fields sin parámetros.') }] });
+    // 7.1: con "anonymous": false, una petición sin credenciales que trae la clave recibe 400 antes de cualquier efecto.
+    if (anonymous && !idempotencyAnonymous)
+      throw new RestepError(400, 'bad_request', t('This API does not take Idempotency-Key without credentials.', 'Esta API no admite Idempotency-Key sin credenciales.'),
+        { errors: [{ header: 'Idempotency-Key', code: 'unknown', detail: t('Send it with credentials, or leave it out.', 'Envíala con credenciales, o no la envíes.') }] });
+    return m[1].replace(/\\(["\\])/g, '$1');
+  }
+
+  // 5.1: el id de un POST según id_from. Devuelve las entradas de errors (vacía si vale).
+  function idErrors(c, body) {
+    const from = c.idFrom ?? 'server';
+    if (!('id' in body)) return from === 'client' ? [{ pointer: '/id', code: 'required', detail: t('This collection takes its id from the client: send id.', 'Esta colección recibe el id del cliente: envía id.') }] : [];
+    if (from === 'server') return [{ pointer: '/id', code: 'read_only', detail: t('The server assigns id.', 'El servidor asigna el id.') }];
+    const v = body.id;
+    if (typeof v !== 'string') return [{ pointer: '/id', code: 'type', detail: t('id must be a string.', 'id tiene que ser una cadena.') }];
+    if (!isId(v)) return [{ pointer: '/id', code: 'format', detail: t('id is made of A-Z a-z 0-9 - . _ ~, and is not "." or "..".', 'id se hace con A-Z a-z 0-9 - . _ ~, y no es "." ni "..".') }];
+    if (c.idRegExp && !c.idRegExp.test(v)) return [{ pointer: '/id', code: 'format', detail: t(`id must match ${c.idPattern}.`, `id tiene que cumplir ${c.idPattern}.`) }];
+    return [];
   }
 
   async function create(c, ctx) {
     const req = ctx.request;
-    const rawKey = req.headers.get('idempotency-key');
-    let key = null;
-    if (rawKey !== null) {
-      const m = rawKey.trim().match(/^"((?:[\x20\x21\x23-\x5b\x5d-\x7e]|\\["\\])*)"$/);
-      if (!m) throw new RestepError(400, 'bad_request', t('Idempotency-Key must be a quoted string, such as "8e03978e-40d5".', 'Idempotency-Key tiene que ser una cadena entre comillas, como "8e03978e-40d5".'));
-      key = m[1];
-    } else if (c.requireIdempotencyKey) throw new RestepError(400, 'idempotency_key_required', t('This collection requires Idempotency-Key.', 'Esta colección exige Idempotency-Key.'));
+    const key = idempotencyKey(c, ctx);
     const [body, sent] = await readBody(ctx, ['application/json']);
-    // 7.1: una clave es de un principal y de un destino; dos peticiones son la misma si sus cuerpos son iguales como JSON.
-    const scope = key !== null ? `${await hash(String(ctx.principal ?? ''))} POST ${ctx.url.pathname} ${key}` : null;
-    const print = scope && await hash(canonical(sent));
-    const saved = scope ? await idempotencyStore.reserve(scope, print, idempotencyTtl * 1000) : null;
+    // 7.1: una clave es de un principal y de un destino (método y ruta, tras decodificar los porcentajes, sin la query).
+    // Dos peticiones son la misma si además coinciden su query (tras decodificar, sin importar el orden) y sus cuerpos como JSON.
+    const scope = key !== null ? `${await hash(String(ctx.principal ?? ''))} POST ${ctx.path} ${key}` : null;
+    const query = [...ctx.url.searchParams].sort(([a, x], [b, y]) => (a < b ? -1 : a > b ? 1 : x < y ? -1 : x > y ? 1 : 0));
+    const print = scope && await hash(canonical([query, sent]));
+    const saved = scope ? await idempotencyStore.reserve(scope, print, idempotencyTtl * 1000, ctx) : null;
     let reserved = scope && !saved;
+    let effectStarted = false;
     try {
       if (saved && saved.print === print) {
-        if (!saved.response) throw new RestepError(409, 'conflict', t('The same request is still being processed.', 'La misma petición todavía se está procesando.'));
+        // 7.1: la misma petición mientras la primera sigue en curso; el cliente puede repetirla con la misma clave.
+        if (!saved.response) throw new RestepError(409, 'request_in_progress', t('The same request is still being processed: send it again with the same key in a moment.', 'La misma petición todavía se está procesando: vuelve a enviarla con la misma clave dentro de un momento.'), { headers: { 'Retry-After': '1' } });
         const [status, data, headers] = saved.response;
         return respond(ctx, status, data, { ...headers, 'Idempotent-Replayed': 'true' });
       }
@@ -695,71 +911,114 @@ export function createRestep(options) {
         if (ifNone !== null && weakMatch(ifNone, tag)) throw new RestepError(412, 'precondition_failed', t('If-None-Match matches the current collection.', 'If-None-Match coincide con la colección actual.'));
       }
       if (saved) throw new RestepError(422, 'idempotency_mismatch', t('That Idempotency-Key was already used with a different request.', 'Esa Idempotency-Key ya se usó con otra petición.'));
-      if ('id' in body) throw invalid([{ pointer: '/id', code: 'read_only', detail: t('The server assigns id.', 'El servidor asigna el id.') }]);
-      const errors = await bodyErrors(c, body, undefined, ctx);
-      const data = { ...body };
+      const ownId = 'id' in body && (c.idFrom === 'client' || c.idFrom === 'either') ? body.id : undefined;
+      const { id: _, ...rest } = body;
+      const errors = [...idErrors(c, body), ...await bodyErrors(c, rest, undefined, ctx)];
+      const data = { ...rest };
+      for (const [f, d] of Object.entries(c.fields)) if ('default' in d && !(f in data)) data[f] = d.default; // 4.3
       for (const f of maps(c)) if (!isObject(data[f])) data[f] = {};
       for (const f of Object.keys(data)) if (data[f] === null && c.fields[f].type !== 'relation') delete data[f];
       errors.push(...requiredErrors(c, data).filter((e) => !errors.some((x) => x.pointer === e.pointer)));
       if (!errors.length) errors.push(...await customErrors(c, data, { ...ctx, collection: c, method: 'POST' }));
       if (errors.length) throw invalid(errors);
-      const stored = await c.data.create(data, { ...ctx, collection: c });
+      const make = async () => {
+        // 5.4: el 409 de un id cogido va después del 422. taken() responde igual lo vea el cliente o no (5.1).
+        if (ownId !== undefined && await c.data.taken(ownId, { ...ctx, collection: c })) throw takenError();
+        // Once the adapter starts, an exception does not prove that no effect occurred.
+        effectStarted = true;
+        return c.data.create(ownId !== undefined ? { id: ownId, ...data } : data, { ...ctx, collection: c });
+      };
+      // Dentro del proceso, comprobar el id y crear es atómico; entre procesos lo garantiza la clave primaria del adaptador.
+      const stored = ownId !== undefined ? await withLock(`${c.name}/${ownId}`, make) : await make();
       if (!stored || stored.id == null) throw new Error(`restep-server: ${c.name}.data.create tiene que devolver el elemento con su id`);
+      if (ownId !== undefined && String(stored.id) !== ownId) throw new Error(`restep-server: ${c.name}.data.create tiene que guardar el id que eligió el cliente`);
       const row = represent(c, stored);
+      const etag = await etagOf(row);
       const minimal = ctx.preferMinimal;
-      const response = [201, minimal ? undefined : row, { Location: itemPath(c, row.id), ETag: await etagOf(row),
+      const response = [201, minimal ? undefined : { ...row, _etag: etag }, { Location: itemPath(c, row.id), ETag: etag,
         'Cache-Group-Invalidation': groups([`${base}${c.path}`, itemPath(c, row.id)]), ...(minimal && { 'Preference-Applied': 'return=minimal' }) }];
-      if (scope) { await idempotencyStore.complete(scope, response); reserved = false; }
+      if (scope) { await idempotencyStore.complete(scope, response, ctx); reserved = false; }
       return respond(ctx, ...response);
+    } catch (e) {
+      // Un 409 taken del adaptador (su clave primaria) es un rechazo sin efecto: no gasta la clave.
+      if (e instanceof RestepError && e.status === 409 && e.extra.errors?.some((x) => x.code === 'taken')) effectStarted = false;
+      throw e;
     } finally {
       // Una petición rechazada antes de ejecutarse no gasta la clave (7.1).
-      if (reserved) await idempotencyStore.release(scope);
+      // Keep uncertain outcomes reserved until recovery; never blindly repeat the effect.
+      if (reserved && !effectStarted) await idempotencyStore.release(scope, ctx);
     }
   }
 
+  // PATCH y DELETE de un elemento, y PATCH de un singleton (id undefined).
   async function writeItem(c, id, ctx) {
     const patch = ctx.method === 'PATCH' ? (await readBody(ctx, ['application/merge-patch+json', 'application/json']))[0] : null;
-    return withLock(`${c.name}/${id}`, async () => {
+    return withLock(c.singleton ? `singleton:${c.name}` : `${c.name}/${id}`, async () => {
       const cctx = { ...ctx, collection: c };
-      const raw = await c.data.get(id, cctx);
-      if (!raw) throw notFound(ctx.url.pathname);
+      // forUpdate: inside createTransaction, the adapter locks what it reads (SELECT ... FOR UPDATE), so
+      // If-Match and the write are atomic across processes too (7.2).
+      const raw = c.singleton ? await c.data.get({ ...cctx, forUpdate: true }) : await c.data.get(id, { ...cctx, forUpdate: true });
+      if (!raw) throw notFound(ctx.path);
       const current = represent(c, raw);
       const tag = await etagOf(current);
       const ifMatch = ctx.request.headers.get('if-match'), ifNone = ctx.request.headers.get('if-none-match');
-      if (c.requireIfMatch && ifMatch === null) throw new RestepError(428, 'precondition_required', t('This collection requires If-Match to write.', 'Esta colección exige If-Match para escribir.'));
+      if (c.requireIfMatch && ifMatch === null) throw new RestepError(428, 'precondition_required', t('This resource requires If-Match to write.', 'Este recurso exige If-Match para escribir.'));
       if (ifMatch !== null && !strongMatch(ifMatch, tag)) throw new RestepError(412, 'precondition_failed', t('Someone changed it: read it again before writing.', 'Alguien lo ha cambiado: vuelve a leerlo antes de escribir.'));
       if (ifNone !== null && weakMatch(ifNone, tag)) throw new RestepError(412, 'precondition_failed', t('If-None-Match matches the current item.', 'If-None-Match coincide con el elemento actual.'));
-      const invalidate = { 'Cache-Group-Invalidation': groups([`${base}${c.path}`, itemPath(c, id)]) };
+      const path = itemPath(c, id);
+      const invalidate = { 'Cache-Group-Invalidation': groups(c.singleton ? [path] : [`${base}${c.path}`, path]) };
       if (ctx.method === 'DELETE') {
         await c.data.delete(id, cctx);
         return respond(ctx, 204, undefined, invalidate);
       }
-      if ('id' in patch) {
+      // 5.1: id es de solo lectura: con su valor actual se ignora; con otro, 422 read_only sin aplicar nada.
+      if (!c.singleton && 'id' in patch) {
         if (patch.id !== id) throw invalid([{ pointer: '/id', code: 'read_only', detail: t('id cannot change.', 'id no puede cambiar.') }]);
         delete patch.id;
       }
       const errors = await bodyErrors(c, patch, current, ctx);
       if (errors.length) throw invalid(errors);
       const { id: _, ...rest } = current;
-      const merged = applyPatch(c, Object.fromEntries(Object.entries(rest).filter(([k]) => !k.startsWith('_'))), patch);
+      const before = Object.fromEntries(Object.entries(rest).filter(([k]) => !k.startsWith('_')));
+      const merged = applyPatch(c, before, patch);
       errors.push(...requiredErrors(c, merged));
       if (!errors.length) errors.push(...await customErrors(c, merged, { ...cctx, current, patch }));
       if (errors.length) throw invalid(errors, t('The result of the patch is not valid.', 'El resultado del parche no es válido.'));
-      const stored = await c.data.update(id, merged, { ...cctx, current, patch });
-      const row = represent(c, stored ?? { ...merged, id });
+      // 5.1: un PATCH que no cambia ningún dato deja el elemento como estaba (ni el adaptador ni la ETag se enteran).
+      let row = current;
+      if (canonical(merged) !== canonical(before)) {
+        const stored = c.singleton ? await c.data.update(merged, { ...cctx, current, patch }) : await c.data.update(id, merged, { ...cctx, current, patch });
+        row = represent(c, stored ?? (c.singleton ? merged : { ...merged, id }));
+      }
       const etag = await etagOf(row);
       if (ctx.preferMinimal) return respond(ctx, 204, undefined, { ETag: etag, ...invalidate, 'Preference-Applied': 'return=minimal' });
-      return respond(ctx, 200, row, { ETag: etag, ...invalidate });
+      return respond(ctx, 200, { ...row, _etag: etag }, { ETag: etag, ...invalidate });
     });
   }
 
+  // 11.1 y 4.3: el cuerpo de un POST ya relleno para este cliente y este momento, para empezar un
+  // formulario: los default del esquema create y, encima, lo que devuelve newItem(ctx). No crea nada.
+  async function newItem(c, ctx) {
+    if (!ctx.read) throw new RestepError(405, 'method_not_allowed', t('Only GET and HEAD.', 'Solo GET y HEAD.'), { headers: { Allow: 'GET, HEAD' } });
+    checkReserved(ctx.url.searchParams, []);
+    const defaults = Object.fromEntries(Object.entries(c.fields).filter(([, d]) => 'default' in d).map(([f, d]) => [f, d.default]));
+    const extra = await c.newItem({ ...ctx, collection: c });
+    const data = { ...defaults, ...(isObject(extra) ? extra : {}) };
+    // 8: If-None-Match se evalúa en todo GET, también aquí (con su ETag, o con *).
+    const headers = { ETag: await etagOf(data), 'Cache-Control': 'private, no-store' };
+    if (weakMatch(ctx.request.headers.get('if-none-match'), headers.ETag)) return respond(ctx, 304, undefined, headers);
+    return respond(ctx, 200, data, headers);
+  }
+
+  // GET y HEAD de un elemento o de un singleton.
   async function readItem(c, raw, ctx) {
     const params = ctx.url.searchParams;
     const row = represent(c, raw);
     const fields = parseFields(c, params);
     const itemTag = await etagOf(row);
-    // 7.2: con fields, otra representación con su propia ETag; la del elemento va en _etag.
-    const data = fields ? { ...pick(row, fields), _etag: itemTag } : row;
+    // 7.2: el ETag del elemento completo es la ETag del elemento, calculada sin _etag, y con writes va también en
+    // _etag. Con fields es otra representación, con su propia ETag; la del elemento sigue en _etag.
+    const data = fields ? { ...pick(row, fields), ...(writable && { _etag: itemTag }) } : await withEtag(row);
     const tag = fields ? await etagOf(data) : itemTag;
     const headers = { ETag: tag, 'Cache-Control': cacheControl(ctx, 'no-cache'), 'Cache-Groups': groups([itemPath(c, row.id)]) };
     const ifMatch = ctx.request.headers.get('if-match');
@@ -768,9 +1027,41 @@ export function createRestep(options) {
     return respond(ctx, 200, data, headers);
   }
 
+  // 5.8: credenciales que el navegador añade solo (cookies, autenticación HTTP, certificado de cliente).
+  // "auto": las hay si la petición trae Cookie o Authorization Basic o Digest; un certificado de cliente no se ve
+  // desde Request, así que quien lo use pone browserCredentials: true.
+  const browserCredentialed = (request) => (typeof browserCredentials === 'function' ? !!browserCredentials(request)
+    : browserCredentials === 'auto' ? request.headers.has('cookie') || /^(basic|digest)\s/i.test(request.headers.get('authorization') ?? '')
+    : browserCredentials);
+  // ¿La envió un navegador desde un origen que no es el de la API ni uno permitido (cors.origins)?
+  function foreignOrigin(ctx) {
+    const sent = ctx.request.headers.get('origin'), site = ctx.request.headers.get('sec-fetch-site');
+    if (sent === null) return site === 'cross-site' || site === 'same-site';
+    if (sent === 'null') return site !== 'same-origin'; // Referrer-Policy: no-referrer manda Origin: null a su propio origen
+    return sent !== origin(ctx.url) && !(Array.isArray(corsOrigins) && corsOrigins.includes(sent));
+  }
+
+  // 5.9: GET, HEAD y PATCH de un singleton; POST y DELETE dan 405.
+  async function serveSingleton(s, ctx) {
+    if (!s.methods.includes(ctx.method) && ctx.method !== 'HEAD') {
+      const allow = [...s.methods, 'HEAD'].join(', ');
+      throw new RestepError(405, 'method_not_allowed', t(`Supports ${allow}.`, `Admite ${allow}.`), { headers: { Allow: allow } });
+    }
+    // 5.9: include y los demás parámetros reservados, salvo fields en una lectura, dan unsupported_parameter.
+    checkReserved(ctx.url.searchParams, ctx.read ? ['fields'] : []);
+    ctx.preferMinimal = /(^|[ ,;])return=minimal\b/.test(ctx.request.headers.get('prefer') ?? '');
+    if (ctx.read) {
+      const raw = await s.data.get({ ...ctx, collection: s });
+      if (!raw) throw notFound(ctx.path); // 5.9 y 4.2: el adaptador devuelve null a un principal que no puede usarlo
+      return readItem(s, raw, ctx);
+    }
+    const write = (x) => writeItem(s, undefined, x);
+    return createTransaction ? createTransaction((transaction) => write({ ...ctx, transaction }), ctx) : write(ctx);
+  }
+
   async function route(ctx) {
     const { url, method } = ctx;
-    // 10.5: los metadatos son públicos y no son un recurso de la API.
+    // 11.5: los metadatos son públicos y no son un recurso de la API.
     if (oauth && url.pathname === metadataPath) {
       if (!ctx.read) throw new RestepError(405, 'method_not_allowed', t('Only GET and HEAD.', 'Solo GET y HEAD.'), { headers: { Allow: 'GET, HEAD' } });
       const meta = { resource: `${origin(url)}${base}/`, authorization_servers: oauth.authorizationServers,
@@ -785,20 +1076,34 @@ export function createRestep(options) {
       return new Response(method === 'HEAD' ? null : JSON.stringify({ status: ok ? 'pass' : 'fail' }),
         { status: ok ? 200 : 503, headers: { 'Content-Type': 'application/health+json', 'Cache-Control': 'no-store' } });
     }
-    if (url.pathname !== `${base}/` && !url.pathname.startsWith(`${base}/`)) throw notFound(url.pathname);
+    // 3: cada segmento de la ruta se compara tras decodificar los porcentajes (/books/%37 es /books/7). Un segmento
+    // que al decodificarse tiene "/" no es ninguna ruta de la API.
+    let segments;
+    try { segments = url.pathname.split('/').slice(1).map(decodeURIComponent); } catch { throw notFound(url.pathname); }
+    if (segments.some((s) => s.includes('/'))) throw notFound(url.pathname);
+    ctx.path = `/${segments.join('/')}`;
+    if (ctx.path !== `${base}/` && !ctx.path.startsWith(`${base}/`)) throw notFound(url.pathname);
     ctx.principal = await principalOf(ctx.request, url);
-    const rel = url.pathname.slice(base.length);
+    // 5.8 (paso 1 del orden de 5.4): una escritura con credenciales que el navegador añade solo, desde un origen
+    // que no es el de la API ni uno permitido, da 403 sin efecto.
+    if (!ctx.read && ctx.principal != null && browserCredentialed(ctx.request) && foreignOrigin(ctx))
+      throw new RestepError(403, 'forbidden', t('This origin may not write with these credentials.', 'Este origen no puede escribir con estas credenciales.'));
+    const rel = ctx.path.slice(base.length);
     if (rel === '/') return serveDiscovery(ctx);
+
+    // 11.1: la acción new de una colección (GET /books:new); los dos puntos pueden venir como %3A.
+    const action = Object.values(colls).find((x) => x.newItem && rel === `${x.path}:new`);
+    if (action) return newItem(action, ctx);
+    const single = Object.values(singles).find((s) => rel === s.path);
+    if (single) return serveSingleton(single, ctx);
 
     let c, id;
     for (const x of Object.values(colls)) {
       if (rel === x.path) { c = x; break; }
       if (rel.startsWith(`${x.path}/`)) {
         const rest = rel.slice(x.path.length + 1);
-        let decoded;
-        try { decoded = decodeURIComponent(rest); } catch { decoded = ''; }
-        // Un id son caracteres no reservados (3); los dos puntos serían una acción, que no se implementa.
-        if (rest && !rest.includes('/') && /^[A-Za-z0-9\-._~]+$/.test(decoded) && decoded !== '.' && decoded !== '..') { c = x; id = decoded; }
+        // Un id son caracteres no reservados (3); cualquier otra cosa (dos puntos de una acción, otro segmento) no existe.
+        if (isId(rest)) { c = x; id = rest; }
         break;
       }
     }
@@ -806,7 +1111,8 @@ export function createRestep(options) {
     let raw;
     if (id !== undefined) { // 5.4: el 404 va antes que el 405 y el 400
       raw = await c.data.get(id, { ...ctx, collection: c });
-      if (!raw) throw notFound(url.pathname);
+      // 3: un id se compara punto de código a punto de código; un adaptador que devuelve otro (07 por 7) no vale.
+      if (!raw || String(raw.id) !== id) throw notFound(url.pathname);
     }
     const methods = id === undefined ? c.methods : c.itemMethods;
     if (!methods.includes(method) && method !== 'HEAD') {
@@ -827,15 +1133,17 @@ export function createRestep(options) {
       return respond(ctx, 200, data, headers);
     }
     if (ctx.read) return readItem(c, raw, ctx);
-    if (id === undefined) return create(c, ctx);
-    return writeItem(c, id, ctx);
+    const write = id === undefined ? (x) => create(c, x) : (x) => writeItem(c, id, x);
+    return createTransaction ? createTransaction((transaction) => write({ ...ctx, transaction }), ctx) : write(ctx);
   }
 
-  // CORS (opcional) para clientes de navegador, como el explorador: cors: true (cualquier origen) o
-  // cors: { origins: ['https://…'] }. Responde el preflight y expone las cabeceras que un cliente
-  // Restep necesita leer (ETag para escribir con If-Match, Location, Link, Allow, Retry-After…).
+  // CORS (5.8, opcional) para clientes de navegador, como el explorador: cors: true (cualquier origen) o
+  // cors: { origins: ['https://…'] }. Responde el preflight sin reglas de Restep y expone las cabeceras
+  // que un cliente Restep necesita leer (ETag para escribir con If-Match, Location, Link, Allow, Retry-After…).
+  // Con una lista de orígenes, la respuesta depende de Origin: Vary: Origin en todas, también sin Origin.
   const corsOrigins = cors === true ? '*' : cors?.origins ?? null;
-  const EXPOSE = 'ETag, Location, Link, Allow, Retry-After, Content-Language, Deprecation, Sunset, Cache-Groups, Cache-Group-Invalidation, WWW-Authenticate';
+  const varyOrigin = Array.isArray(corsOrigins);
+  const EXPOSE = 'ETag, Location, Link, Allow, Accept-Patch, Accept-Query, Retry-After, Content-Language, Deprecation, Sunset, Idempotent-Replayed, Preference-Applied, Cache-Groups, Cache-Group-Invalidation, WWW-Authenticate, DPoP-Nonce';
   function corsOrigin(request) {
     const origin = request.headers.get('origin');
     if (!corsOrigins || !origin) return null;
@@ -849,21 +1157,23 @@ export function createRestep(options) {
         'Access-Control-Allow-Methods': 'GET, HEAD, POST, PATCH, DELETE, QUERY',
         'Access-Control-Allow-Headers': request.headers.get('access-control-request-headers') ?? 'Content-Type',
         'Access-Control-Max-Age': '86400',
-        ...(allow !== '*' && { Vary: 'Origin' }),
+        ...(varyOrigin && { Vary: 'Origin' }),
       } });
     }
     const response = await handleRestep(request);
-    if (!allow) return response;
+    if (!allow && !varyOrigin) return response;
     const h = new Headers(response.headers);
-    h.set('Access-Control-Allow-Origin', allow);
-    h.set('Access-Control-Expose-Headers', EXPOSE);
-    if (allow !== '*') h.append('Vary', 'Origin');
+    if (allow) {
+      h.set('Access-Control-Allow-Origin', allow);
+      h.set('Access-Control-Expose-Headers', EXPOSE);
+    }
+    if (varyOrigin) h.append('Vary', 'Origin');
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers: h });
   }
   async function handleRestep(request) {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
-    const ctx = { request, url, method, read: method === 'GET' || method === 'HEAD', principal: null,
+    const ctx = { request, url, method, path: url.pathname, read: method === 'GET' || method === 'HEAD', principal: null,
       lang: pickLanguage(request.headers.get('accept-language'), languageList) };
     try {
       return await route(ctx);
