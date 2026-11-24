@@ -1,7 +1,7 @@
 {
   "name": "restep-server",
   "version": "0.2.0",
-  "description": "Biblioteca de servidor para APIs Restep 1: tú escribes el acceso a los datos",
+  "description": "Server library for Restep 1 APIs: you write the data access",
   "license": "MIT",
   "files": [
     "restep-server.mjs",

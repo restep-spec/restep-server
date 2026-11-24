@@ -1,18 +1,18 @@
-# restep-server (prototipo)
+# restep-server (prototype)
 
-Biblioteca para escribir un servidor [Restep 1](https://restep.wubytes.com/1/) (borrador 6: el
-descubrimiento declara `"restep": "1.0-draft.6"`) sin implementar el protocolo a mano: tú declaras las colecciones y escribes el acceso a tus datos;
-la biblioteca hace el resto. Un solo archivo, Node 18+, sin dependencias.
+A library for writing a [Restep 1](https://restep.wubytes.com/1/) server (draft 6: discovery
+declares `"restep": "1.0-draft.6"`) without implementing the protocol by hand: you declare the collections and write the access to your data;
+the library does the rest. One file, Node 18+, no dependencies.
 
-El núcleo solo usa la Web estándar (`Request`, `Response`, `URL`, Web Crypto):
-`createRestep(...)` devuelve `handle(request) => Promise<Response>`, que funciona igual en Node,
-Deno, Bun o Cloudflare Workers. Para Node http, Express y Hono hay adaptadores finos.
+The core only uses the standard Web APIs (`Request`, `Response`, `URL`, Web Crypto):
+`createRestep(...)` returns `handle(request) => Promise<Response>`, which works the same on Node,
+Deno, Bun or Cloudflare Workers. There are thin adapters for Node http, Express and Hono.
 
 ```bash
 npm install restep-server
 ```
 
-## Ejemplo mínimo
+## Minimal example
 
 ```js
 import { createServer } from 'node:http';
@@ -36,11 +36,11 @@ const api = createRestep({
 createServer(toNodeListener(api)).listen(8080);
 ```
 
-Con eso ya hay descubrimiento en `/`, `GET/HEAD /books` con filtros, orden, `fields`, `limit`,
-cursores y `count`, y `GET/PATCH/DELETE /books/7` y `POST /books` con validación, Merge Patch,
-`ETag`, `If-Match` e `Idempotency-Key`. Un ejemplo completo, con mapas de idioma, relaciones,
-fechas, duraciones, una regla de validación propia, `id` elegidos por el cliente, una colación,
-un singleton y oauth opcional, está en [`example-api.mjs`](example-api.mjs) (lo arranca
+That already gives you discovery at `/`, `GET/HEAD /books` with filters, sorting, `fields`, `limit`,
+cursors and `count`, and `GET/PATCH/DELETE /books/7` and `POST /books` with validation, Merge Patch,
+`ETag`, `If-Match` and `Idempotency-Key`. A full example, with language maps, relations,
+dates, durations, a custom validation rule, client-chosen `id`s, a collation,
+a singleton and optional oauth, is in [`example-api.mjs`](example-api.mjs) (started by
 [`example.mjs`](example.mjs)):
 
 ```bash
@@ -48,250 +48,250 @@ PORT=8810 node tools/restep-server/example.mjs
 npx restep-check http://localhost:8810/ --writes      # 0 failed
 ```
 
-## Qué haces tú: el adaptador de datos
+## Your part: the data adapter
 
-Cada colección lleva en `data` un objeto con estos métodos. `list` y `get` son obligatorios; los
-demás son opcionales y, si faltan, su método HTTP desaparece de la colección (`methods`,
-`item_methods` y el `Allow` de los `405` se calculan solos).
+Each collection takes in `data` an object with these methods. `list` and `get` are required; the
+rest are optional and, if missing, their HTTP method disappears from the collection (`methods`,
+`item_methods` and the `Allow` of `405` responses are computed for you).
 
-| Método | Recibe | Devuelve |
+| Method | Receives | Returns |
 |---|---|---|
 | `list(query, ctx)` | `{ filter, sort, limit, cursor, count, fields }` | `{ items, next, total }` |
-| `get(id, ctx)` | el `id` de la URL (antes de `PATCH` y `DELETE`, con `ctx.forUpdate: true`: bloquéalo si hay transacción) | el elemento o `null` (da `404`) |
-| `create(data, ctx)` | el cuerpo ya validado, sin miembros `_`; con `id` solo si el cliente lo eligió (`idFrom`) | el elemento guardado, con su `id` (el del cliente, si lo eligió) |
-| `update(id, data, ctx)` | el elemento completo ya fusionado y validado (`ctx.patch`: el parche; `ctx.current`: lo anterior). No se llama si el `PATCH` no cambia ningún dato (5.1) | el elemento guardado |
-| `delete(id, ctx)` | el `id` | nada |
-| `taken(id, ctx)` | un `id` elegido por el cliente; solo con `idFrom: 'client'` o `'either'`, donde es obligatorio | `true` si la colección tiene o tuvo ese `id`, lo vea o no este principal (5.1) |
+| `get(id, ctx)` | the `id` from the URL (before `PATCH` and `DELETE`, with `ctx.forUpdate: true`: lock it if there is a transaction) | the item or `null` (gives `404`) |
+| `create(data, ctx)` | the already validated body, without `_` members; with `id` only if the client chose it (`idFrom`) | the saved item, with its `id` (the client's, if it chose one) |
+| `update(id, data, ctx)` | the full item, already merged and validated (`ctx.patch`: the patch; `ctx.current`: the previous state). Not called if the `PATCH` changes no data (5.1) | the saved item |
+| `delete(id, ctx)` | the `id` | nothing |
+| `taken(id, ctx)` | a client-chosen `id`; only with `idFrom: 'client'` or `'either'`, where it is required | `true` if the collection has or had that `id`, whether this principal can see it or not (5.1) |
 
-- `filter` es una lista de `{ field, op, value, type }` con el valor ya convertido a su tipo (un
-  `in` trae una lista; un `null`, un booleano). `sort` es `[{ field, desc, type }]` y siempre
-  acaba en `id`, para desempatar. `field` puede ser `campo`, `mapa.etiqueta` o `relacion.id`.
-- Un filtro con nombre (`namedFilters`, 6.1) llega en `filter` como `{ named, value }`: `value` es
-  `true` en un interruptor y el valor ya convertido en uno con `type`. Tu adaptador lo traduce por su
-  nombre (un scope del ORM, una subconsulta, una búsqueda de texto). `memoryAdapter` usa el `apply`
-  de su declaración, que también llega en el filtro.
-- `cursor` es lo que tu `list` devolvió en `next` para la página anterior (un desplazamiento, una
-  clave, lo que quieras que sea JSON), o `null` en la primera. La biblioteca lo firma con HMAC y lo
-  liga a la colección, los filtros, el orden y el principal, así que nunca te llega uno manipulado
-  ni de otra consulta.
-- `fields` es solo una pista: puedes devolver los elementos enteros. Si la colección tiene `update`
-  o `delete`, llega `null`, porque el `_etag` de cada elemento del listado se calcula sobre la
-  representación completa.
-- `ctx` lleva `request`, `principal`, `lang` y `collection`.
-- `get` compara el `id` punto de código a punto de código (3): `07` no es `7`. Si tu clave es
-  numérica, no conviertas `"07"` en `7` (la biblioteca da `404` igualmente si el elemento que
-  devuelves tiene otro `id`). `get` devuelve `null` también para un elemento que este principal no
-  puede ver: así el `404` y la entrada `unknown` de una relación son iguales en los dos casos (5.1).
-- Con `idFrom: 'client'` o `'either'` (5.1), los `id` usados no se reutilizan nunca: `taken` tiene
-  que recordar los de los elementos borrados mientras exista la colección (o un hash de ellos), y
-  el `id` que asigna tu `create` sin `id` del cliente no puede ser uno que la colección haya
-  tenido. Entre procesos, tu clave primaria tiene que rechazar el duplicado: lanza
-  `takenError()` (exportado) desde `create`.
-- Los filtros y el orden llegan con `collation` (`"codepoint"` o `"server"`, 6.1). Con
-  `"server"`, la igualdad y el orden son los tuyos (una colación de la base de datos), totales,
-  deterministas y coherentes entre sí. Si un campo no se puede leer en un elemento para este
-  principal, tu `list` lo trata como ausente (6.1), y `total` cuenta solo lo que ve (6.5): la
-  biblioteca no sabe qué puede leer cada principal.
-- Para errores de tu dominio, lanza `new RestepError(409, 'conflict', 'Ya existe.', { reason: 'duplicate' })`.
-  Cualquier otra excepción da `500 internal` y pasa por `onError`.
-- `memoryAdapter(filas)` implementa todo en memoria para pruebas y ejemplos, `taken` incluido; su
-  colación `"server"` no distingue mayúsculas ni acentos (`Intl.Collator` con `sensitivity: 'base'`).
-  `memorySingleton(objeto)` es lo mismo para un singleton. Exporta también las piezas para un
-  adaptador propio: `matches`, `sorter`, `compareValues` y `valueAt`, con las reglas de comparación
-  del 6.1 (decimales exactos, fechas e instantes, duraciones, texto por puntos de código o con la
-  colación `"server"`).
+- `filter` is a list of `{ field, op, value, type }` with the value already converted to its type (an
+  `in` brings a list; a `null`, a boolean). `sort` is `[{ field, desc, type }]` and always
+  ends in `id`, as a tiebreaker. `field` can be `field`, `map.tag` or `relation.id`.
+- A named filter (`namedFilters`, 6.1) arrives in `filter` as `{ named, value }`: `value` is
+  `true` for a switch, and the already converted value for one with `type`. Your adapter translates it by its
+  name (an ORM scope, a subquery, a text search). `memoryAdapter` uses the `apply`
+  from its declaration, which also arrives in the filter.
+- `cursor` is whatever your `list` returned in `next` for the previous page (an offset, a
+  key, anything that is JSON), or `null` on the first one. The library signs it with HMAC and
+  binds it to the collection, the filters, the sort order and the principal, so you never get a
+  tampered one or one from another query.
+- `fields` is only a hint: you may return whole items. If the collection has `update`
+  or `delete`, it arrives as `null`, because the `_etag` of each listed item is computed over the
+  full representation.
+- `ctx` carries `request`, `principal`, `lang` and `collection`.
+- `get` compares the `id` code point by code point (3): `07` is not `7`. If your key is
+  numeric, do not turn `"07"` into `7` (the library gives `404` anyway if the item you
+  return has a different `id`). `get` also returns `null` for an item this principal cannot
+  see: that way the `404` and the `unknown` entry of a relation are the same in both cases (5.1).
+- With `idFrom: 'client'` or `'either'` (5.1), used `id`s are never reused: `taken` has
+  to remember those of deleted items for as long as the collection exists (or a hash of them), and
+  the `id` your `create` assigns when the client sends none cannot be one the collection has
+  had. Across processes, your primary key has to reject the duplicate: throw
+  `takenError()` (exported) from `create`.
+- Filters and sort fields arrive with `collation` (`"codepoint"` or `"server"`, 6.1). With
+  `"server"`, equality and ordering are yours (a database collation): total,
+  deterministic and consistent with each other. If a field cannot be read on an item by this
+  principal, your `list` treats it as absent (6.1), and `total` counts only what it sees (6.5): the
+  library does not know what each principal can read.
+- For domain errors, throw `new RestepError(409, 'conflict', 'Already exists.', { reason: 'duplicate' })`.
+  Any other exception gives `500 internal` and goes through `onError`.
+- `memoryAdapter(rows)` implements everything in memory for tests and examples, `taken` included; its
+  `"server"` collation ignores case and accents (`Intl.Collator` with `sensitivity: 'base'`).
+  `memorySingleton(object)` is the same for a singleton. It also exports the pieces for your own
+  adapter: `matches`, `sorter`, `compareValues` and `valueAt`, with the comparison rules
+  of 6.1 (exact decimals, dates and instants, durations, text by code point or with the
+  `"server"` collation).
 
-## Qué hace la biblioteca
+## What the library does
 
-- **Descubrimiento (1.1, 4.2, 4.3)**: `"restep": "1.0-draft.6"`, perfiles (`core`, `query`,
-  `writes` si hay escrituras, `cache`), `idempotency` (con `anonymous: false` si se pide), `status`,
-  colecciones con `description`, `methods`, `item_methods`, `id_from`, `filter` con tipos y
-  operadores, `sort`, `collations`, `max_limit`, `count`, `language_maps`, `relations` y esquemas
-  JSON Schema `item`, `create` y `update` generados a partir de los campos, y `singletons`. El
-  mismo documento para todos los principales (solo cambian los textos con `Accept-Language`), con
-  `ETag`, `304` y `Vary: Accept-Language`; `private` cuando hay principal. No añade miembros propios.
-- **Nombres (3)**: al arrancar rechaza colecciones, singletons, campos y filtros con nombre que no
-  cumplan `ALPHA *63( ALPHA / DIGIT / "_" / "-" )`; un `reason` mal formado en un `RestepError` da `500`.
-- **Rutas (3)**: cada segmento se compara tras decodificar porcentajes (`/books/%37` es `/books/7`;
-  `/books/07` no lo es).
-- **Cabecera de perfil (4.1)** en todas las respuestas de la API.
-- **Parámetros (5.3, 6)**: rechaza todo parámetro reservado que el recurso no implementa para ese
-  método (`unsupported_parameter`) y todo valor erróneo (`invalid_parameter`), siempre con
-  `parameter`: filtros y operadores no declarados, tipos, `in` vacío, el mismo filtro dos veces
-  (también `filter[f]` con `filter[f][eq]`), duraciones con años o meses, `limit` fuera de rango,
-  campos de `fields` que no existen o que entran en un mapa de idioma, cursores manipulados o de
-  otra consulta, parámetros repetidos, `$loquesea`.
-- **Errores (5.4)**: `problem+json` con `type`, `title`, `status`, `code` y `detail`, en el orden
-  del borrador 6: `401`/`403` → `404` → `405` → `400` de parámetros y cabeceras → `400` del cuerpo,
-  `415` y `413` → repetición y `409 request_in_progress` → `428` → `412` → `422` → `409 conflict`.
-- **Escrituras (3, 5.1, 7)**: `Content-Type: application/json` obligatorio (en `PATCH`, también
-  `application/merge-patch+json`), con `charset` solo `utf-8`: cualquier otro tipo, otro `charset`
-  o ninguno da `415` (con `Accept-Patch` en un `PATCH`), y un cuerpo vacío con `application/json`
-  da `400`. `201` con `Location`, Merge Patch (RFC 7396) con las excepciones de Restep (las
-  relaciones se sustituyen enteras y solo se lee su `id`; los mapas de idioma se fusionan y quedan
-  en `{}`), miembros `_` ignorados, `422 invalid` con `errors` y `pointer`, `413` por tamaño,
-  `Prefer: return=minimal`. Un `PATCH` que no cambia ningún dato no toca el elemento ni su ETag.
-  Una relación con su valor actual se ignora sin comprobarla; a un elemento que no existe da `422`
-  con `unknown` en `/relación/id`.
-- **`id` (5.1)**: con `idFrom` sin declarar o `'server'`, un `id` en el `POST` da `422` con
-  `read_only` en `/id`. Con `'client'` (obligatorio, `required` si falta) o `'either'`
-  (opcional), lo valida (`type`, `format`, y `idPattern` si lo das) y da `409 conflict` con `taken`
-  en `/id` a uno que la colección tiene o tuvo, después de los `422`.
-- **Concurrencia (7.2)**: ETag fuerte del elemento completo, calculada sin `_etag`; `_etag` en toda
-  respuesta cuyo cuerpo es un elemento (su `GET`, con o sin `fields`, el `201` del `POST` y el `200`
-  del `PATCH`) y en cada elemento de un listado cuando admite `PATCH` o `DELETE` (la misma ETag que
-  su `GET`, calculada sobre la representación completa aunque haya `fields`), `If-Match`
-  (listas, `*`, comparación fuerte) evaluado de forma atómica con la escritura dentro del proceso
-  y, con `createTransaction` y `ctx.forUpdate`, entre procesos,
-  `If-None-Match` (`304` en lecturas, `412` en escrituras) y `428` con `requireIfMatch: true`.
-- **Idempotencia (7.1)**: `Idempotency-Key` como cadena de Structured Fields sin parámetros (una
-  mal formada da `400 bad_request` con una entrada `header`), por principal y destino (método y
-  ruta decodificada, sin la query); dos peticiones son la misma si además coinciden su query (tras
-  decodificar, en cualquier orden) y sus cuerpos como valores JSON. Repetición con `Idempotent-Replayed: true`,
-  `422 idempotency_mismatch` (también mientras la primera sigue en curso), `409
-  request_in_progress` con `Retry-After` para la misma petición mientras la primera sigue en curso, `400
-  idempotency_key_required` con `requireIdempotencyKey: true`. Una petición rechazada no gasta la clave.
-  Con `idempotencyAnonymous: false`, el descubrimiento dice `"anonymous": false` y un `POST` sin
-  credenciales (sin principal) con la clave da `400 bad_request` con la entrada `unknown` antes de
-  cualquier efecto, y `requireIdempotencyKey` no se aplica a esas peticiones.
-- **Caché (perfil `cache`, 8)**: `Cache-Control` en toda respuesta a `GET` y `HEAD`, errores
-  incluidos (`private` si hay principal; los errores, `no-store`), ETag en elementos, colecciones,
-  singletons y descubrimiento, `304` con `If-None-Match`, `Cache-Groups` en las lecturas y
-  `Cache-Group-Invalidation` en las escrituras. Una respuesta con principal es `private` también
-  sin este perfil (5.1).
-- **Singletons (5.9)**: `singletons: { me: { path, description, fields, data } }` con `data.get(ctx)`
-  y, para `PATCH`, `data.update(merged, ctx)`. `GET`/`HEAD` con `fields`, ETag, `_etag` y `304`;
-  `PATCH` como el de un elemento (validación, `If-Match`, `428` con `requireIfMatch`, sin cambios
-  no escribe); `POST` y `DELETE` dan `405`; `include` y los demás parámetros reservados,
-  `unsupported_parameter`. Las relaciones llevan `href`. Sin `id`, sin mapas de idioma ni acciones.
-- **Origen (5.8)**: un `POST`, `PATCH` o `DELETE` autenticado con credenciales que el navegador
-  añade solo, cuyo `Origin` no es el de la API ni uno de `cors.origins`, da `403 forbidden` sin
-  efecto (`Origin: null` vale con `Sec-Fetch-Site: same-origin`; sin `Origin`, decide
-  `Sec-Fetch-Site`). Ver `browserCredentials`.
-- **Idioma (5.6)**: los textos de la biblioteca (errores, descripciones) en inglés y español,
-  elegidos con el *lookup* del RFC 4647; los tuyos pueden ser `t('en', 'es')`. Los datos nunca cambian.
-- **Mapas de idioma (3)**: validación de etiquetas (`format`), tipos y etiquetas no admitidas
-  (`unknown`, con la opción `languageTags`), filtro y orden por `campo.etiqueta` exacta.
-- **Estado del servicio (4.4)** con `status: { path: '/health', check: async () => true }`.
-- **oauth (11.5)** con `oauth: { authorizationServers, scopesSupported, verifyToken(token, request) }`:
-  metadatos del RFC 9728 en su URL, retos `WWW-Authenticate` con `resource_metadata` solo en la raíz.
-  Sin oauth, `authenticate(request)` puede devolver un principal o lanzar un `RestepError` 401/403.
+- **Discovery (1.1, 4.2, 4.3)**: `"restep": "1.0-draft.6"`, profiles (`core`, `query`,
+  `writes` if there are writes, `cache`), `idempotency` (with `anonymous: false` if asked), `status`,
+  collections with `description`, `methods`, `item_methods`, `id_from`, `filter` with types and
+  operators, `sort`, `collations`, `max_limit`, `count`, `language_maps`, `relations` and
+  `item`, `create` and `update` JSON Schemas generated from the fields, and `singletons`. The
+  same document for every principal (only the texts change, with `Accept-Language`), with
+  `ETag`, `304` and `Vary: Accept-Language`; `private` when there is a principal. It adds no custom members.
+- **Names (3)**: at startup it rejects collections, singletons, fields and named filters that do not
+  match `ALPHA *63( ALPHA / DIGIT / "_" / "-" )`; a malformed `reason` in a `RestepError` gives `500`.
+- **Paths (3)**: each segment is compared after percent-decoding (`/books/%37` is `/books/7`;
+  `/books/07` is not).
+- **Profile header (4.1)** on every API response.
+- **Parameters (5.3, 6)**: rejects every reserved parameter the resource does not implement for that
+  method (`unsupported_parameter`) and every wrong value (`invalid_parameter`), always with
+  `parameter`: undeclared filters and operators, types, empty `in`, the same filter twice
+  (also `filter[f]` with `filter[f][eq]`), durations with years or months, `limit` out of range,
+  `fields` entries that do not exist or reach into a language map, tampered cursors or cursors from
+  another query, repeated parameters, `$whatever`.
+- **Errors (5.4)**: `problem+json` with `type`, `title`, `status`, `code` and `detail`, in the order
+  of draft 6: `401`/`403` → `404` → `405` → `400` for parameters and headers → `400` for the body,
+  `415` and `413` → replay and `409 request_in_progress` → `428` → `412` → `422` → `409 conflict`.
+- **Writes (3, 5.1, 7)**: `Content-Type: application/json` required (for `PATCH`, also
+  `application/merge-patch+json`), with `utf-8` as the only `charset`: any other type, another `charset`
+  or none gives `415` (with `Accept-Patch` on a `PATCH`), and an empty body with `application/json`
+  gives `400`. `201` with `Location`, Merge Patch (RFC 7396) with the Restep exceptions
+  (relations are replaced whole and only their `id` is read; language maps are merged and end up
+  as `{}`), `_` members ignored, `422 invalid` with `errors` and `pointer`, `413` for size,
+  `Prefer: return=minimal`. A `PATCH` that changes no data touches neither the item nor its ETag.
+  A relation set to its current value is ignored without checking it; one pointing to an item that
+  does not exist gives `422` with `unknown` at `/relation/id`.
+- **`id` (5.1)**: with `idFrom` undeclared or `'server'`, an `id` in the `POST` gives `422` with
+  `read_only` at `/id`. With `'client'` (mandatory, `required` if missing) or `'either'`
+  (optional), it validates it (`type`, `format`, and `idPattern` if you give one) and gives `409 conflict`
+  with `taken` at `/id` for one the collection has or had, after the `422`s.
+- **Concurrency (7.2)**: strong ETag of the full item, computed without `_etag`; `_etag` in every
+  response whose body is an item (its `GET`, with or without `fields`, the `201` of the `POST` and the `200`
+  of the `PATCH`) and in each item of a listing when it allows `PATCH` or `DELETE` (the same ETag as
+  its `GET`, computed over the full representation even with `fields`), `If-Match`
+  (lists, `*`, strong comparison) evaluated atomically with the write within the process
+  and, with `createTransaction` and `ctx.forUpdate`, across processes,
+  `If-None-Match` (`304` on reads, `412` on writes) and `428` with `requireIfMatch: true`.
+- **Idempotency (7.1)**: `Idempotency-Key` as a Structured Fields string without parameters (a
+  malformed one gives `400 bad_request` with a `header` entry), per principal and target (method and
+  decoded path, without the query); two requests are the same if, in addition, their query (after
+  decoding, in any order) and their bodies as JSON values match. Replay with `Idempotent-Replayed: true`,
+  `422 idempotency_mismatch` (also while the first one is still in progress), `409
+  request_in_progress` with `Retry-After` for the same request while the first is still in progress, `400
+  idempotency_key_required` with `requireIdempotencyKey: true`. A rejected request does not use up the key.
+  With `idempotencyAnonymous: false`, discovery says `"anonymous": false` and a `POST` without
+  credentials (no principal) carrying the key gives `400 bad_request` with the `unknown` entry before
+  any effect, and `requireIdempotencyKey` does not apply to those requests.
+- **Caching (`cache` profile, 8)**: `Cache-Control` on every response to `GET` and `HEAD`, errors
+  included (`private` if there is a principal; errors, `no-store`), ETag on items, collections,
+  singletons and discovery, `304` with `If-None-Match`, `Cache-Groups` on reads and
+  `Cache-Group-Invalidation` on writes. A response with a principal is `private` even
+  without this profile (5.1).
+- **Singletons (5.9)**: `singletons: { me: { path, description, fields, data } }` with `data.get(ctx)`
+  and, for `PATCH`, `data.update(merged, ctx)`. `GET`/`HEAD` with `fields`, ETag, `_etag` and `304`;
+  `PATCH` like an item's (validation, `If-Match`, `428` with `requireIfMatch`, no write when nothing
+  changes); `POST` and `DELETE` give `405`; `include` and the other reserved parameters,
+  `unsupported_parameter`. Relations carry `href`. No `id`, no language maps, no actions.
+- **Origin (5.8)**: a `POST`, `PATCH` or `DELETE` authenticated with credentials the browser
+  adds on its own, whose `Origin` is neither the API's nor one of `cors.origins`, gives `403 forbidden` with no
+  effect (`Origin: null` is fine with `Sec-Fetch-Site: same-origin`; without `Origin`,
+  `Sec-Fetch-Site` decides). See `browserCredentials`.
+- **Language (5.6)**: the library's texts (errors, descriptions) in English and Spanish,
+  chosen with RFC 4647 *lookup*; yours can be `t('en', 'es')`. Data never changes.
+- **Language maps (3)**: tag validation (`format`), types and unsupported tags
+  (`unknown`, with the `languageTags` option), filtering and sorting by exact `field.tag`.
+- **Service status (4.4)** with `status: { path: '/health', check: async () => true }`.
+- **oauth (11.5)** with `oauth: { authorizationServers, scopesSupported, verifyToken(token, request) }`:
+  RFC 9728 metadata at its URL, `WWW-Authenticate` challenges with `resource_metadata` only at the root.
+  Without oauth, `authenticate(request)` can return a principal or throw a 401/403 `RestepError`.
 
-## Opciones de `createRestep`
+## `createRestep` options
 
-| Opción | Por defecto | Para qué |
+| Option | Default | Purpose |
 |---|---|---|
-| `collections` | (obligatoria) | `{ nombre: { fields, filter, namedFilters, sort, defaultSort, collations, maxLimit, defaultLimit, count, path, description, idFrom, idPattern, validate, newItem, requireIfMatch, requireIdempotencyKey, data } }`. `collations`: `{ campo: 'codepoint' \| 'server' }` (6.1), solo campos `string` (o `campo.etiqueta`) de `filter` o `sort`, nunca `id`. `idFrom`: `'server'`, `'client'` o `'either'` (5.1). `idPattern`: expresión regular que restringe el `id` del cliente, también en el esquema `create` |
-| `singletons` | — | `{ nombre: { path, description, fields, validate, requireIfMatch, data } }` (5.9) |
-| `base` | `''` | Ruta de la raíz de la API, como `/api` |
-| `version` | `'1'` | El `version` del documento de descubrimiento: la versión mayor de tu API, la de su ruta (`/v2/` → `'2'`, 5.5) |
-| `languages` | `['en', 'es']` | Idiomas de los textos; el primero es el de por defecto |
-| `languageTags` | cualquiera | Etiquetas que aceptan los mapas de idioma |
-| `secret` | al azar | Clave de los cursores; fíjala si hay varias instancias |
-| `createTransaction` | — | Envuelve cada escritura (`POST`, `PATCH`, `DELETE`) en una transacción del adaptador: la creación con su registro de idempotencia, y `If-Match` con la escritura; ver «Persistencia» |
-| `idempotencyStore` | en memoria | Almacén de claves; uno duradero con `reserve`, `complete` y `release` |
-| `idempotencyTtl` | `86400` | Segundos (mínimo 86400) |
-| `idempotencyAnonymous` | `true` | `false` rechaza `Idempotency-Key` sin credenciales y lo declara (7.1). Pasar de `true` a `false` es un cambio incompatible (5.5) |
-| `browserCredentials` | `'auto'` (`false` con `oauth`) | Si las credenciales de una petición las añade el navegador solo (5.8). `'auto'`: si trae `Cookie` o `Authorization: Basic`/`Digest`. `true`: siempre (un certificado de cliente no se ve desde `Request`). `false`: solo tokens en `Authorization`. O una función `(request) => boolean`. Los orígenes permitidos son el de la API (`publicOrigin` o el de la petición) y los de `cors.origins` |
-| `maxBodyBytes` | 1 MiB | Más da `413` |
-| `cors` | — | `true` (cualquier origen) o `{ origins: [...] }` (5.8): responde el preflight sin reglas de Restep y expone `ETag`, `Location`, `Link`, `Allow`, `Accept-Patch`, `Accept-Query`, `Retry-After`, `Deprecation`, `Sunset`, `Idempotent-Replayed`, `Preference-Applied`, `DPoP-Nonce`… a los clientes de navegador. Con una lista de orígenes, toda respuesta lleva `Vary: Origin`, también sin `Origin` o con un origen no permitido |
-| `docs` | — | URL de la documentación, o lista de `{ href, hreflang, title }`: va como `Link: rel="service-doc"` en el descubrimiento (4.2, DEBERÍA) |
-| `status`, `oauth`, `authenticate` | — | Ver arriba |
-| `publicOrigin` | el de la petición | Origen público detrás de un proxy (para oauth y para la comprobación de `Origin`) |
-| `onError` | `console.error` | Recibe las excepciones que acaban en `500` |
+| `collections` | (required) | `{ name: { fields, filter, namedFilters, sort, defaultSort, collations, maxLimit, defaultLimit, count, path, description, idFrom, idPattern, validate, newItem, requireIfMatch, requireIdempotencyKey, data } }`. `collations`: `{ field: 'codepoint' \| 'server' }` (6.1), only `string` fields (or `field.tag`) in `filter` or `sort`, never `id`. `idFrom`: `'server'`, `'client'` or `'either'` (5.1). `idPattern`: regular expression that restricts the client's `id`, also in the `create` schema |
+| `singletons` | — | `{ name: { path, description, fields, validate, requireIfMatch, data } }` (5.9) |
+| `base` | `''` | Path of the API root, such as `/api` |
+| `version` | `'1'` | The `version` of the discovery document: your API's major version, the one in its path (`/v2/` → `'2'`, 5.5) |
+| `languages` | `['en', 'es']` | Languages of the texts; the first one is the default |
+| `languageTags` | any | Tags the language maps accept |
+| `secret` | random | Cursor key; set it if there are several instances |
+| `createTransaction` | — | Wraps each write (`POST`, `PATCH`, `DELETE`) in an adapter transaction: the creation with its idempotency record, and `If-Match` with the write; see "Persistence" |
+| `idempotencyStore` | in memory | Key store; a durable one with `reserve`, `complete` and `release` |
+| `idempotencyTtl` | `86400` | Seconds (minimum 86400) |
+| `idempotencyAnonymous` | `true` | `false` rejects `Idempotency-Key` without credentials and declares it (7.1). Going from `true` to `false` is a breaking change (5.5) |
+| `browserCredentials` | `'auto'` (`false` with `oauth`) | Whether a request's credentials are added by the browser on its own (5.8). `'auto'`: if it carries `Cookie` or `Authorization: Basic`/`Digest`. `true`: always (a client certificate is not visible from `Request`). `false`: only tokens in `Authorization`. Or a function `(request) => boolean`. The allowed origins are the API's (`publicOrigin` or the request's) and those in `cors.origins` |
+| `maxBodyBytes` | 1 MiB | More gives `413` |
+| `cors` | — | `true` (any origin) or `{ origins: [...] }` (5.8): answers the preflight without Restep rules and exposes `ETag`, `Location`, `Link`, `Allow`, `Accept-Patch`, `Accept-Query`, `Retry-After`, `Deprecation`, `Sunset`, `Idempotent-Replayed`, `Preference-Applied`, `DPoP-Nonce`… to browser clients. With a list of origins, every response carries `Vary: Origin`, also without `Origin` or with a disallowed origin |
+| `docs` | — | Documentation URL, or a list of `{ href, hreflang, title }`: it goes as `Link: rel="service-doc"` in discovery (4.2, SHOULD) |
+| `status`, `oauth`, `authenticate` | — | See above |
+| `publicOrigin` | the request's | Public origin behind a proxy (for oauth and for the `Origin` check) |
+| `onError` | `console.error` | Receives the exceptions that end in `500` |
 
-Los tipos de campo son los del descubrimiento (`string`, `integer`, `number`, `decimal`,
-`boolean`, `date`, `datetime`, `duration`, `enum` con `values`) más `map` (mapa de idioma) y
-`relation` (a uno, con `to`). Un campo puede llevar `required: true` y `description`. `validate(row,
-ctx)` devuelve una lista de entradas de `errors` para reglas propias (ver la de ciclos en el ejemplo).
-Los nombres de campo siguen la gramática de 3; uno que no la cumple no arranca.
+The field types are those of discovery (`string`, `integer`, `number`, `decimal`,
+`boolean`, `date`, `datetime`, `duration`, `enum` with `values`) plus `map` (language map) and
+`relation` (to-one, with `to`). A field can carry `required: true` and `description`. `validate(row,
+ctx)` returns a list of `errors` entries for custom rules (see the cycle rule in the example).
+Field names follow the grammar of 3; one that does not will not start.
 
-### Formularios (4.3)
+### Forms (4.3)
 
-Con estas opciones, el esquema `create` guía al cliente que pinta un formulario de alta:
+With these options, the `create` schema guides a client that renders a creation form:
 
-| En el campo | En el esquema | Qué hace |
+| On the field | In the schema | What it does |
 |---|---|---|
-| `title: t('Title', 'Título')` | `title`, en el idioma de la petición | Etiqueta del campo |
-| `description` | `description` | Texto de ayuda |
-| `default: 'novela-negra'` | `default`, solo en `create` | Valor inicial. El `POST` que no trae el campo lo guarda con ese valor (un `null` sí lo trae). Un campo obligatorio con `default` deja de estar en el `required` de `create` |
-| `labels: { 'novela-negra': t('Crime', 'Novela negra'), … }` | `oneOf` de `const` con `title`, en lugar de `enum` | Opciones de un `enum` con su etiqueta |
-| `examples: ['PT6H']` | `examples` | Ejemplos para el placeholder; nunca se envían |
+| `title: t('Title', 'Título')` | `title`, in the request's language | Field label |
+| `description` | `description` | Help text |
+| `default: 'novela-negra'` | `default`, only in `create` | Initial value. A `POST` without the field saves it with that value (a `null` does count as bringing it). A required field with `default` is no longer in the `create` schema's `required` |
+| `labels: { 'novela-negra': t('Crime', 'Novela negra'), … }` | `oneOf` of `const` with `title`, instead of `enum` | Options of an `enum` with their label |
+| `examples: ['PT6H']` | `examples` | Examples for the placeholder; never sent |
 
-Los campos salen en el orden en que se declaran en `fields`, que es el orden en que se muestran.
+Fields come out in the order they are declared in `fields`, which is the order they are shown in.
 
-Para lo que depende del cliente o del momento (la fecha de hoy, su tienda), `newItem: (ctx) => cuerpo`
-añade la acción `GET /colección:new` (extensión `actions`, 11.1). Devuelve los `default` y, encima,
-lo que devuelva `newItem`, con `Cache-Control: private, no-store`, y no crea nada. Es la prueba que
-cita el trabajo futuro de la spec (Apéndice B), así que puede cambiar.
+For what depends on the client or the moment (today's date, their shop), `newItem: (ctx) => body`
+adds the action `GET /collection:new` (`actions` extension, 11.1). It returns the `default`s and, on top,
+whatever `newItem` returns, with `Cache-Control: private, no-store`, and creates nothing. It is the trial that
+the spec's future work cites (Appendix B), so it may change.
 
-## Adaptadores de framework
+## Framework adapters
 
 ```js
 createServer(toNodeListener(api)).listen(8080);       // Node http
-app.use(toExpress(api));                               // Express (con base: '/api' si va en app.use('/api', …))
+app.use(toExpress(api));                               // Express (with base: '/api' if mounted with app.use('/api', …))
 app.all('*', toHono(api));                             // Hono
 export default { fetch: api.handle };                  // Cloudflare Workers, Deno, Bun
 ```
 
-`toExpress` usa `req.originalUrl` y, si un body parser ya leyó el cuerpo, lo vuelve a serializar.
-Mejor montarlo antes de `express.json()`: ese parser responde por su cuenta a un JSON mal formado,
-sin `problem+json`.
+`toExpress` uses `req.originalUrl` and, if a body parser already read the body, serializes it again.
+Better to mount it before `express.json()`: that parser answers malformed JSON on its own,
+without `problem+json`.
 
-## Perfiles que cubre y que no
+## Profiles covered and not covered
 
-Anuncia en el descubrimiento solo lo que cumple: `core`, `query`, `cache`, `writes` (si alguna
-colección o singleton escribe), `actions` (si hay `newItem`) y `oauth` (si se configura).
+Discovery only announces what it complies with: `core`, `query`, `cache`, `writes` (if any
+collection or singleton writes), `actions` (if there is `newItem`) and `oauth` (if configured).
 
-| Perfil o extensión | Estado |
+| Profile or extension | Status |
 |---|---|
-| `core` | Sí, salvo retiradas (`deprecations`, `Deprecation`, `Sunset`, 5.5), campos de solo lectura propios (solo `id` lo es), `406` por `Accept` (siempre responde JSON) y versiones mayores (`/v2/`) |
-| `query` | Sí. Las colaciones `"server"` y los campos que un principal no puede leer los resuelve tu adaptador |
-| `writes` | Sí. Con varias instancias o persistencia, solo con un adaptador transaccional como el de PostgreSQL ([`pg.mjs`](#postgresql)); el bloqueo de `If-Match` propio de la biblioteca solo coordina un proceso |
-| `cache` | Sí (desde el borrador 6 es un perfil aparte; la biblioteca ya hacía lo que pide) |
-| `oauth` | Sí, sin scopes por petición: un `403 insufficient_scope` lo lanza tu `verifyToken` o tu adaptador |
-| `relations` | No: no anuncia el perfil ni hace `include`, ni subcolecciones (`path` con plantilla y `parent`). Las relaciones a uno sí se declaran, se validan y se filtran por `relacion.id` |
-| `sync` | No: ninguna colección declara `sync` y `:changes` da `404` |
-| `actions` | Solo la acción `new` de las colecciones con `newItem`; cualquier otra ruta con dos puntos da `404` |
-| `inherit` | No: ni lo anuncia ni declara `inherit` |
-| `batch`, `filter-expr`, `query-method` | No: sus parámetros y rutas fallan en voz alta (`unsupported_parameter`, `404`) |
+| `core` | Yes, except deprecations (`deprecations`, `Deprecation`, `Sunset`, 5.5), custom read-only fields (only `id` is one), `406` for `Accept` (it always answers JSON) and major versions (`/v2/`) |
+| `query` | Yes. `"server"` collations and fields a principal cannot read are handled by your adapter |
+| `writes` | Yes. With several instances or persistence, only with a transactional adapter such as the PostgreSQL one ([`pg.mjs`](#postgresql)); the library's own `If-Match` lock only coordinates one process |
+| `cache` | Yes (since draft 6 it is a separate profile; the library already did what it asks) |
+| `oauth` | Yes, without per-request scopes: a `403 insufficient_scope` is thrown by your `verifyToken` or your adapter |
+| `relations` | No: it does not announce the profile, does no `include`, and has no subcollections (`path` with a template and `parent`). To-one relations are declared, validated and filterable by `relation.id` |
+| `sync` | No: no collection declares `sync` and `:changes` gives `404` |
+| `actions` | Only the `new` action of collections with `newItem`; any other path with a colon gives `404` |
+| `inherit` | No: it neither announces it nor declares `inherit` |
+| `batch`, `filter-expr`, `query-method` | No: their parameters and paths fail loudly (`unsupported_parameter`, `404`) |
 
-### Borrador 6, regla a regla
+### Draft 6, rule by rule
 
-| Regla (borrador 6) | Dónde |
+| Rule (draft 6) | Where |
 |---|---|
-| `"restep": "1.0-draft.6"` (1.1) | Biblioteca |
-| Estado estable o experimental (1.2) | No aplica: no anuncia ninguna parte experimental |
-| `cache` separado de `writes`; `private` en toda respuesta con credenciales (5.1, 8) | Biblioteca: anuncia `cache`; `private` cuando hay principal. Que tu `authenticate` devuelva un principal para toda petición con credenciales es cosa tuya |
-| `inherit` como extensión (11.6) | No implementado, no anunciado |
-| `id_from`, `taken`, `id` borrados no reutilizados (5.1) | Biblioteca, con `taken` del adaptador (memoria: sí; `pg.mjs`: no admite `idFrom`) |
-| `collations` (6.1) | Declaración y validación en la biblioteca; la colación `"server"` la aplica el adaptador (`memoryAdapter`: sin mayúsculas ni acentos) |
-| `singletons` (5.9) | Biblioteca, sin `id`, mapas de idioma ni acciones |
-| Subcolecciones con `parent` (4.2) | No implementado: `path` con plantilla no arranca |
-| `415` y `charset` en escrituras (3, 5.1) | Biblioteca |
-| Orden entre errores (5.4) | Biblioteca, para los errores que da ella; el `403` por campo y el `409` por estado los lanza tu `validate` o tu adaptador |
-| Query en «la misma petición», no en el destino (7.1) | Biblioteca |
-| `idempotency.anonymous` (7.1) | Biblioteca (`idempotencyAnonymous`); no hay acciones `POST` idempotentes que ignoren la clave |
-| `_etag` en toda respuesta de un elemento, ETag sin `_etag` (7.2) | Biblioteca |
-| `fields`/`include` en escrituras, `limit` sin `max_limit` → `unsupported_parameter` (5.3, 6.3, 6.4) | Biblioteca (siempre declara `max_limit`) |
-| Gramática de los nombres (3) | Biblioteca, al arrancar; `reason` al lanzar |
-| `+` como espacio; ruta comparada tras decodificar (3, 5.2) | Biblioteca |
-| Solo lectura en `POST`/`PATCH` (4.3, 5.1) | Solo `id`; una relación con su valor actual se ignora sin comprobarla. Campos de solo lectura propios: no implementado |
-| Descubrimiento igual para todos; miembros propios con `x-` (4.2) | Biblioteca (no añade miembros propios) |
-| `deprecations`, `announced`, `kind` (5.5) | No implementado |
-| `Origin`/`Sec-Fetch-Site` con credenciales del navegador (5.8) | Biblioteca, con `browserCredentials`; un certificado de cliente lo tienes que declarar tú |
-| `sync` por colección (10) | No implementado (`:changes` da `404`) |
-| `403` por campo que no se puede cambiar, `409` por estado, campos ilegibles en filtros y `total`, `422` igual para un elemento invisible (5.1, 6.1, 6.5) | Delegado: tu adaptador y tu `validate` |
-| `429`/`503` solo sin efecto (5.7) | La biblioteca no los da; si tu adaptador los lanza, que sea sin efecto |
+| `"restep": "1.0-draft.6"` (1.1) | Library |
+| Stable or experimental status (1.2) | Does not apply: it announces no experimental part |
+| `cache` separate from `writes`; `private` on every response with credentials (5.1, 8) | Library: announces `cache`; `private` when there is a principal. Making your `authenticate` return a principal for every request with credentials is up to you |
+| `inherit` as an extension (11.6) | Not implemented, not announced |
+| `id_from`, `taken`, deleted `id`s not reused (5.1) | Library, with the adapter's `taken` (memory: yes; `pg.mjs`: does not support `idFrom`) |
+| `collations` (6.1) | Declaration and validation in the library; the `"server"` collation is applied by the adapter (`memoryAdapter`: case- and accent-insensitive) |
+| `singletons` (5.9) | Library, without `id`, language maps or actions |
+| Subcollections with `parent` (4.2) | Not implemented: a `path` with a template will not start |
+| `415` and `charset` on writes (3, 5.1) | Library |
+| Order between errors (5.4) | Library, for the errors it produces; the per-field `403` and the state `409` are thrown by your `validate` or your adapter |
+| Query in "the same request", not in the target (7.1) | Library |
+| `idempotency.anonymous` (7.1) | Library (`idempotencyAnonymous`); there are no idempotent `POST` actions that ignore the key |
+| `_etag` on every item response, ETag without `_etag` (7.2) | Library |
+| `fields`/`include` on writes, `limit` without `max_limit` → `unsupported_parameter` (5.3, 6.3, 6.4) | Library (it always declares `max_limit`) |
+| Name grammar (3) | Library, at startup; `reason` when thrown |
+| `+` as space; path compared after decoding (3, 5.2) | Library |
+| Read-only on `POST`/`PATCH` (4.3, 5.1) | Only `id`; a relation set to its current value is ignored without checking it. Custom read-only fields: not implemented |
+| Same discovery for everyone; custom members with `x-` (4.2) | Library (adds no custom members) |
+| `deprecations`, `announced`, `kind` (5.5) | Not implemented |
+| `Origin`/`Sec-Fetch-Site` with browser credentials (5.8) | Library, with `browserCredentials`; a client certificate you have to declare yourself |
+| `sync` per collection (10) | Not implemented (`:changes` gives `404`) |
+| `403` for a field that cannot be changed, `409` for state, unreadable fields in filters and `total`, the same `422` for an invisible item (5.1, 6.1, 6.5) | Delegated: your adapter and your `validate` |
+| `429`/`503` only without effect (5.7) | The library does not produce them; if your adapter throws them, it must be without effect |
 
-## Persistencia, fallos y varias instancias
+## Persistence, failures and multiple instances
 
-El almacén en memoria es para ejemplos y pruebas: pierde las claves al reiniciar. Un
-almacén duradero separado de los datos **no basta** para cumplir §7.1. El efecto de crear
-el recurso y la respuesta que se repetirá deben confirmarse en la misma transacción.
+The in-memory store is for examples and tests: it loses the keys on restart. A
+durable store separate from the data **is not enough** to comply with §7.1. The effect of creating
+the resource and the response that will be replayed must be committed in the same transaction.
 
-`createTransaction(work, ctx)` envuelve cada escritura completa (`POST` de colección, `PATCH` y
-`DELETE` de un elemento):
+`createTransaction(work, ctx)` wraps each complete write (collection `POST`, item `PATCH` and
+`DELETE`):
 
 ```js
 const api = createRestep({
@@ -301,35 +301,35 @@ const api = createRestep({
 });
 ```
 
-`database.transaction` es el método transaccional de tu adaptador, no una dependencia de
-Restep. Debe confirmar únicamente si `work` termina bien, revertir si falla y resolver su
-promesa después del commit. No debe reejecutar automáticamente el callback con la misma
-petición consumida. La conexión llega como `ctx.transaction` a `data.get`, `data.create`,
-`data.update` y `data.delete`, y como último argumento `ctx` a `reserve(key, print, ttlMs, ctx)`,
-`complete(key, response, ctx)` y `release(key, ctx)`. **Todos deben usar esa misma transacción**.
-`reserve` debe ser atómico entre procesos; su implementación debe resolver también las reservas
-concurrentes. Antes de `PATCH` y `DELETE`, la biblioteca lee el elemento con `ctx.forUpdate: true`:
-el adaptador debe bloquearlo (`SELECT … FOR UPDATE`) para que evaluar `If-Match` y escribir sean
-atómicos también entre procesos (7.2).
+`database.transaction` is your adapter's transactional method, not a Restep
+dependency. It must commit only if `work` succeeds, roll back if it fails, and resolve its
+promise after the commit. It must not automatically re-run the callback with the same
+consumed request. The connection arrives as `ctx.transaction` in `data.get`, `data.create`,
+`data.update` and `data.delete`, and as the last `ctx` argument of `reserve(key, print, ttlMs, ctx)`,
+`complete(key, response, ctx)` and `release(key, ctx)`. **They must all use that same transaction**.
+`reserve` must be atomic across processes; its implementation must also resolve concurrent
+reservations. Before `PATCH` and `DELETE`, the library reads the item with `ctx.forUpdate: true`:
+the adapter must lock it (`SELECT … FOR UPDATE`) so that evaluating `If-Match` and writing are
+atomic across processes too (7.2).
 
-Sin esa coordinación, una excepción después de llamar a `data.create` deja la reserva
-pendiente: el reintento recibe `409 request_in_progress`, nunca vuelve a crear a ciegas.
-Esto incluye un adaptador que confirma el efecto y después lanza un error de conexión.
-Las reservas pendientes del almacén en memoria no caducan automáticamente. Un almacén
-propio debe conservar las de resultado incierto hasta recuperar la respuesta o demostrar
-que no hubo efecto; no debe borrarlas por un TTL. Esta protección evita duplicados, pero
-puede necesitar recuperación operativa para desbloquear la clave. Las peticiones que
-fallan durante la validación sí liberan su reserva.
+Without that coordination, an exception after calling `data.create` leaves the reservation
+pending: the retry gets `409 request_in_progress`, and never blindly creates again.
+That includes an adapter that commits the effect and then throws a connection error.
+Pending reservations in the in-memory store do not expire automatically. A custom
+store must keep those with an uncertain outcome until it recovers the response or proves
+there was no effect; it must not delete them on a TTL. This protection prevents duplicates, but
+may need operational recovery to unblock the key. Requests that
+fail during validation do release their reservation.
 
-El mutex de esta biblioteca solo protege el proceso actual. Los efectos externos (pagos,
-correo) requieren su propia coordinación; el hook no los convierte en transacciones de base
-de datos.
+This library's mutex only protects the current process. External effects (payments,
+email) need their own coordination; the hook does not turn them into database
+transactions.
 
 ### PostgreSQL
 
-[`pg.mjs`](pg.mjs) es un adaptador transaccional para PostgreSQL 11 o posterior. Tampoco tiene
-dependencias: recibe un pool compatible con [`pg`](https://node-postgres.com/) (`pool.connect()`
-da un cliente con `query(text, values)` y `release(err)`).
+[`pg.mjs`](pg.mjs) is a transactional adapter for PostgreSQL 11 or later. It has no
+dependencies either: it takes a pool compatible with [`pg`](https://node-postgres.com/) (`pool.connect()`
+gives a client with `query(text, values)` and `release(err)`).
 
 ```js
 import pg from 'pg';
@@ -337,42 +337,42 @@ import { createRestep } from './restep-server.mjs';
 import { migrate, pgTransaction, pgIdempotencyStore, pgDocumentAdapter } from './pg.mjs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-await migrate(pool); // una vez, al desplegar; no desde varios procesos a la vez
+await migrate(pool); // once, at deploy time; not from several processes at once
 
 const api = createRestep({
   collections: { books: { fields, data: pgDocumentAdapter({ pool, collection: 'books' }) } },
   createTransaction: pgTransaction(pool),
   idempotencyStore: pgIdempotencyStore(),
-  secret: process.env.RESTEP_SECRET, // el mismo en todas las instancias, para los cursores
+  secret: process.env.RESTEP_SECRET, // the same on every instance, for the cursors
 });
 ```
 
-| Exporta | Qué hace |
+| Export | What it does |
 |---|---|
-| `schema(opts)`, `migrate(pool, opts)` | El SQL de las tablas (abajo) y su ejecución. `opts`: `idempotencyTable`, `itemsTable` |
-| `pgTransaction(pool)` | El `createTransaction`: `BEGIN`, el trabajo en una conexión, `COMMIT`; `ROLLBACK` si falla. Un `COMMIT` fallido (conexión caída, confirmación perdida) da `500` y no se reintenta: el reintento del cliente con la misma clave lo resuelve leyendo la base de datos |
-| `pgIdempotencyStore({ table })` | El almacén de claves. Exige `ctx.transaction` |
-| `pgDocumentAdapter({ pool, collection, table })` | Un adaptador de datos que guarda cada elemento como `jsonb`, con `id` de una secuencia (`bigserial`: nunca se reutilizan, y `07` no es `7`). No tiene `taken`, así que no admite `idFrom: 'client'` ni `'either'`. Escribe en la transacción y bloquea con `ctx.forUpdate`. `list` filtra y ordena en el proceso con las reglas de la biblioteca: vale para pruebas y colecciones pequeñas; para las grandes, escribe tu adaptador con SQL siguiendo el mismo contrato |
-| `inFlightReservations(pool)` | Las transacciones que tienen ahora una clave reservada: `pid`, `state`, `age_ms`, `xact_start`, `application_name`, `client_addr`, `wait_event` |
-| `terminateReservation(pool, pid)` | Termina el backend de una reserva atascada y espera a que desaparezca. Rechaza (`false`) un `pid` que no tiene reserva |
-| `purgeExpired(pool, { table })` | Borra las respuestas guardadas cuyo plazo ha pasado |
+| `schema(opts)`, `migrate(pool, opts)` | The SQL for the tables (below) and running it. `opts`: `idempotencyTable`, `itemsTable` |
+| `pgTransaction(pool)` | The `createTransaction`: `BEGIN`, the work on one connection, `COMMIT`; `ROLLBACK` if it fails. A failed `COMMIT` (dropped connection, lost acknowledgement) gives `500` and is not retried: the client's retry with the same key resolves it by reading the database |
+| `pgIdempotencyStore({ table })` | The key store. Requires `ctx.transaction` |
+| `pgDocumentAdapter({ pool, collection, table })` | A data adapter that stores each item as `jsonb`, with `id`s from a sequence (`bigserial`: never reused, and `07` is not `7`). It has no `taken`, so it does not support `idFrom: 'client'` or `'either'`. It writes in the transaction and locks with `ctx.forUpdate`. `list` filters and sorts in the process with the library's rules: fine for tests and small collections; for large ones, write your own SQL adapter following the same contract |
+| `inFlightReservations(pool)` | The transactions currently holding a reserved key: `pid`, `state`, `age_ms`, `xact_start`, `application_name`, `client_addr`, `wait_event` |
+| `terminateReservation(pool, pid)` | Terminates the backend of a stuck reservation and waits for it to disappear. Rejects (`false`) a `pid` that has no reservation |
+| `purgeExpired(pool, { table })` | Deletes the stored responses whose time has passed |
 
-Tu propio adaptador de datos puede usar `pgTransaction` y `pgIdempotencyStore` igual: basta con
-que sus escrituras usen `ctx.transaction` y su `get` añada `FOR UPDATE` cuando llega
-`ctx.forUpdate` con transacción.
+Your own data adapter can use `pgTransaction` and `pgIdempotencyStore` the same way: its writes
+just need to use `ctx.transaction`, and its `get` must add `FOR UPDATE` when
+`ctx.forUpdate` arrives with a transaction.
 
-**Esquema** (`schema()` lo genera; los nombres de tabla son configurables):
+**Schema** (`schema()` generates it; table names are configurable):
 
 ```sql
 CREATE TABLE restep_idempotency (
-  scope      text PRIMARY KEY,   -- principal (hash), método, ruta y clave
-  print      text NOT NULL,      -- hash del cuerpo como valor JSON
-  response   jsonb,              -- { status, headers, body_text? }: el cuerpo como texto JSON, para repetirlo igual
+  scope      text PRIMARY KEY,   -- principal (hash), method, path and key
+  print      text NOT NULL,      -- hash of the body as a JSON value
+  response   jsonb,              -- { status, headers, body_text? }: the body as JSON text, to replay it verbatim
   created_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL
 );
 CREATE INDEX restep_idempotency_expires ON restep_idempotency (expires_at);
--- Trigger de restricción diferido: una reserva sin respuesta no puede confirmarse.
+-- Deferred constraint trigger: a reservation without a response cannot be committed.
 CREATE CONSTRAINT TRIGGER restep_idempotency_complete AFTER INSERT OR UPDATE ON restep_idempotency
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION restep_idempotency_complete();
 CREATE TABLE restep_items (
@@ -380,29 +380,29 @@ CREATE TABLE restep_items (
 );
 ```
 
-**Cómo garantiza 7.1 y 7.2:**
+**How it guarantees 7.1 and 7.2:**
 
-- La fila de la clave, el recurso creado y la respuesta guardada se confirman en la misma
-  transacción. Si el proceso muere antes del `COMMIT`, PostgreSQL revierte las tres cosas; si
-  muere después, o se pierde la confirmación, las tres están y el reintento repite la respuesta.
-  El trigger diferido impide confirmar una reserva sin respuesta, así que **nunca hay en la tabla
-  reservas con resultado incierto**, y ninguna caduca por TTL: solo caducan respuestas completas.
-- Mientras una petición está en curso, su transacción tiene dos bloqueos consultivos
-  (`pg_try_advisory_xact_lock`): uno de la clave y otro de la clave con el cuerpo. Otra petición con
-  la misma clave, desde cualquier proceso, responde sin esperar: `409 request_in_progress` si su
-  cuerpo es el mismo y `422 idempotency_mismatch` si no. Los bloqueos se liberan solos al acabar la
-  transacción, también si el proceso muere o se termina su backend.
-- `PATCH` y `DELETE` leen el elemento con `FOR UPDATE` dentro de la transacción: una segunda
-  escritura con la misma versión espera a la primera, lee la versión nueva y recibe `412` (o `404`
-  si la primera lo borró).
+- The key row, the created resource and the stored response are committed in the same
+  transaction. If the process dies before the `COMMIT`, PostgreSQL rolls back all three; if
+  it dies after, or the acknowledgement is lost, all three are there and the retry replays the response.
+  The deferred trigger prevents committing a reservation without a response, so **the table never holds
+  reservations with an uncertain outcome**, and none expires on a TTL: only complete responses expire.
+- While a request is in progress, its transaction holds two advisory locks
+  (`pg_try_advisory_xact_lock`): one on the key and another on the key plus the body. Another request with
+  the same key, from any process, answers without waiting: `409 request_in_progress` if its
+  body is the same and `422 idempotency_mismatch` if not. The locks are released on their own when the
+  transaction ends, also if the process dies or its backend is terminated.
+- `PATCH` and `DELETE` read the item with `FOR UPDATE` inside the transaction: a second
+  write with the same version waits for the first, reads the new version and gets `412` (or `404`
+  if the first one deleted it).
 
-**Reservas atascadas: procedimiento operativo.** Una reserva solo existe mientras vive su
-transacción. Si los reintentos de una clave reciben `409` durante mucho tiempo, su transacción sigue
-abierta: una petición lenta, o un proceso colgado (o una conexión medio cerrada) que PostgreSQL aún
-no ha detectado.
+**Stuck reservations: operational procedure.** A reservation only exists while its
+transaction lives. If the retries for a key get `409` for a long time, its transaction is still
+open: a slow request, or a hung process (or a half-closed connection) that PostgreSQL has not
+detected yet.
 
-1. Obsérvalas con `inFlightReservations(pool)` o con SQL (el bloqueo consultivo `(0x52455354, 0)`,
-   compartido, marca a las transacciones con una reserva):
+1. Watch them with `inFlightReservations(pool)` or with SQL (the shared advisory lock
+   `(0x52455354, 0)` marks the transactions holding a reservation):
 
    ```sql
    SELECT a.pid, a.state, now() - a.xact_start AS age, a.application_name, a.client_addr
@@ -411,87 +411,87 @@ no ha detectado.
     ORDER BY a.xact_start;
    ```
 
-   Alerta cuando `age` supere con holgura la duración máxima de una escritura.
-2. Si el proceso dueño sigue trabajando (`state = 'active'`), espera. Si está `idle in transaction`
-   mucho tiempo, o su proceso ya no existe, termínalo: `terminateReservation(pool, pid)` o
+   Alert when `age` comfortably exceeds the maximum duration of a write.
+2. If the owning process is still working (`state = 'active'`), wait. If it has been `idle in transaction`
+   for a long time, or its process no longer exists, terminate it: `terminateReservation(pool, pid)` or
    `SELECT pg_terminate_backend(pid)`.
-3. Terminar el backend revierte la transacción entera: reserva, efecto y respuesta. Esa reversión
-   es la prueba de que no hubo efecto; no hace falta liberar nada a mano. El siguiente reintento con
-   la misma clave crea el recurso una sola vez. Si la transacción llegó a confirmarse antes de
-   terminarla, la fila de la clave tiene su respuesta y el reintento la repite.
-4. Para que esto ocurra solo, configura `idle_in_transaction_session_timeout` (por ejemplo, unas
-   veces la duración máxima de una escritura) y keepalives TCP en el servidor. Es seguro por el mismo
-   motivo: PostgreSQL revierte de forma atómica. Lo que no se debe hacer, y este adaptador no hace, es
-   borrar una reserva confirmada sin respuesta por haber pasado un plazo.
+3. Terminating the backend rolls back the whole transaction: reservation, effect and response. That rollback
+   is the proof there was no effect; nothing needs releasing by hand. The next retry with
+   the same key creates the resource exactly once. If the transaction did commit before it was
+   terminated, the key row has its response and the retry replays it.
+4. To make this happen on its own, set `idle_in_transaction_session_timeout` (for example, a few
+   times the maximum duration of a write) and TCP keepalives on the server. It is safe for the same
+   reason: PostgreSQL rolls back atomically. What must not be done, and this adapter does not do, is
+   delete a committed reservation without a response because a deadline has passed.
 
-Para consultar la respuesta guardada de una clave concreta:
-`SELECT response FROM restep_idempotency WHERE scope LIKE '% POST /books <clave>'`.
-`purgeExpired(pool)` (por ejemplo, una vez al día) borra las respuestas caducadas.
+To look up the stored response for a specific key:
+`SELECT response FROM restep_idempotency WHERE scope LIKE '% POST /books <key>'`.
+`purgeExpired(pool)` (for example, once a day) deletes expired responses.
 
-**Límites.** Los efectos fuera de PostgreSQL (pagos, correo, otra base de datos) no entran en la
-transacción. No se prueba la caída del sistema operativo ni del disco (las pruebas paran
-PostgreSQL con `pg_ctl stop -m immediate`, que sí recupera desde el WAL). Se ha probado con
-PostgreSQL 14, aislamiento `READ COMMITTED` y `pg` 8.
+**Limits.** Effects outside PostgreSQL (payments, email, another database) are not part of the
+transaction. Operating system or disk crashes are not tested (the tests stop
+PostgreSQL with `pg_ctl stop -m immediate`, which does recover from the WAL). Tested with
+PostgreSQL 14, `READ COMMITTED` isolation and `pg` 8.
 
-## Pruebas
+## Tests
 
 ```bash
 node --test tools/restep-server/recovery.test.mjs
 node tools/restep-server/test.mjs
-node --test tools/restep-server/pg.test.mjs   # necesita PostgreSQL y npm install en tools/restep-server
+node --test tools/restep-server/pg.test.mjs   # needs PostgreSQL and npm install in tools/restep-server
 ```
 
-Arrancan el ejemplo en los puertos 8810 y 8811 (este con oauth) y le pasan
-`restep-check --writes` (0.7.0, borrador 6), que tiene que dar 0 fallos; después prueban
-`handle(Request)` directamente (orden de errores, idempotencia con una petición en curso, `428`,
-idioma, `base`, errores del adaptador, configuración errónea y, del borrador 6, `415` y `charset`,
-`_etag`, la query en la idempotencia, `idempotencyAnonymous`, `idFrom` y `taken`, rutas
-decodificadas, `+` como espacio, colaciones, relaciones con su valor actual, singletons,
-gramática de los nombres y `Origin`) y los adaptadores de Express (puerto 8813) y Hono.
+They start the example on ports 8810 and 8811 (the latter with oauth) and run
+`restep-check --writes` (0.7.0, draft 6) against it, which must report 0 failures; then they test
+`handle(Request)` directly (error order, idempotency with a request in progress, `428`,
+language, `base`, adapter errors, wrong configuration and, from draft 6, `415` and `charset`,
+`_etag`, the query in idempotency, `idempotencyAnonymous`, `idFrom` and `taken`, decoded
+paths, `+` as space, collations, relations set to their current value, singletons,
+name grammar and `Origin`) and the Express (port 8813) and Hono adapters.
 
-`pg.test.mjs` crea un clúster temporal (`initdb` en un directorio temporal, solo socket Unix,
-puerto 54320-54329; se para y se borra al terminar, también si falla) y arranca dos procesos
-servidores ([`pg-worker.mjs`](pg-worker.mjs), puertos 8100 y 8101) contra la misma base de datos.
-Prueba con fallos reales: peticiones simultáneas desde los dos procesos, `SIGKILL` antes y después
-del `COMMIT`, un `COMMIT` confirmado cuya respuesta corta un proxy de socket, `pg_terminate_backend`
-de una reserva atascada, caída y recuperación de PostgreSQL, y `PATCH`/`DELETE` concurrentes con la
-misma versión. Busca los binarios en `PG_BIN`, `pg_config --bindir`, el `PATH` y rutas habituales;
-sin binarios o sin `pg` instalado se omite y lo dice (`node tools/verify.mjs` la lista como omitida,
-no como aprobada). Las simulaciones de `recovery.test.mjs` se mantienen como regresiones sin puertos.
+`pg.test.mjs` creates a temporary cluster (`initdb` in a temporary directory, Unix socket only,
+port 54320-54329; stopped and deleted at the end, also on failure) and starts two server
+processes ([`pg-worker.mjs`](pg-worker.mjs), ports 8100 and 8101) against the same database.
+It tests with real failures: simultaneous requests from both processes, `SIGKILL` before and after
+the `COMMIT`, a committed `COMMIT` whose response is cut by a socket proxy, `pg_terminate_backend`
+of a stuck reservation, PostgreSQL crash and recovery, and concurrent `PATCH`/`DELETE` with the
+same version. It looks for the binaries in `PG_BIN`, `pg_config --bindir`, the `PATH` and the usual paths;
+without binaries or without `pg` installed it is skipped and says so (`node tools/verify.mjs` lists it as skipped,
+not as passed). The simulations in `recovery.test.mjs` stay as port-free regressions.
 
-## Dudas sobre la spec
+## Questions about the spec
 
-El borrador 6 resolvió varias de las que había aquí: `count=false` sin `count` declarado y
-`fields` en una escritura dan `unsupported_parameter` (5.3, 6.3), `If-Match` contra un elemento recién
-borrado da `404` (7.2), la idempotencia sin credenciales se puede rechazar con `"anonymous": false`
-(7.1) y el `If-Match` de un `POST` se compara con la ETag del `GET` de la colección sin parámetros
-(7.2). Quedan:
+Draft 6 settled several of the ones listed here: `count=false` without a declared `count` and
+`fields` on a write give `unsupported_parameter` (5.3, 6.3), `If-Match` against a just-deleted
+item gives `404` (7.2), idempotency without credentials can be rejected with `"anonymous": false`
+(7.1), and the `If-Match` of a `POST` is compared with the ETag of the collection's `GET` without parameters
+(7.2). Still open:
 
-- **Esperar o responder `409` con la primera petición en curso** (7.1): la especificación permite
-  las dos cosas. Aquí no se espera: la segunda recibe `409 request_in_progress` (o `422` si su cuerpo
-  es otro) en cuanto ve el bloqueo, para no atar conexiones a peticiones lentas. Un caso límite: una
-  tercera petición con el mismo cuerpo que otra que está a punto de recibir `422` puede recibir un
-  `409` pasajero; su reintento obtiene la respuesta definitiva.
-- **ETag de la colección para `If-Match` en un `POST`** (7.2): es la del `GET` sin parámetros, que
-  aquí es la primera página por defecto, así que no protege de cambios más allá de ella.
-- **Credenciales del navegador** (5.8): una biblioteca no sabe con qué credencial autenticó tu
-  `authenticate`, así que `'auto'` lo deduce de las cabeceras (`Cookie`, `Basic`, `Digest`). Con
-  cookies que no autentican junto a un token en `Authorization`, `'auto'` puede rechazar una
-  escritura de otro origen que la especificación no cubre; pon `browserCredentials: false`.
-- **«El valor que el elemento tendría»** (5.1, campos de solo lectura en un `POST`): la biblioteca
-  no puede saberlo antes de que el adaptador cree el elemento, por eso no ofrece campos de solo
-  lectura propios.
-- **`taken` igual para todos** (5.1): la biblioteca pregunta a `taken` antes de crear, pero que la
-  respuesta no dependa de lo que ve el principal, y que se recuerden los `id` borrados, solo lo
-  puede garantizar el adaptador.
-- **Orden por defecto**: un `id` se compara como texto, así que `"12"` va antes que `"7"`. Es
-  determinista (5.2) y el borrador 6 deja claro que el orden de los `id` es del servidor, pero
-  sorprende; por eso existe `defaultSort`.
+- **Wait or answer `409` while the first request is in progress** (7.1): the specification allows
+  both. Here it does not wait: the second gets `409 request_in_progress` (or `422` if its body
+  differs) as soon as it sees the lock, so as not to tie up connections on slow requests. An edge case: a
+  third request with the same body as another that is about to get `422` may get a transient
+  `409`; its retry gets the final response.
+- **Collection ETag for `If-Match` on a `POST`** (7.2): it is that of the `GET` without parameters, which
+  here is the default first page, so it does not protect against changes beyond it.
+- **Browser credentials** (5.8): a library does not know which credential your
+  `authenticate` used, so `'auto'` infers it from the headers (`Cookie`, `Basic`, `Digest`). With
+  non-authenticating cookies next to a token in `Authorization`, `'auto'` may reject a
+  cross-origin write that the specification does not cover; set `browserCredentials: false`.
+- **"The value the item would have"** (5.1, read-only fields on a `POST`): the library
+  cannot know it before the adapter creates the item, which is why it offers no custom read-only
+  fields.
+- **`taken` the same for everyone** (5.1): the library asks `taken` before creating, but only the
+  adapter can guarantee that the answer does not depend on what the principal sees, and that deleted
+  `id`s are remembered.
+- **Default order**: an `id` is compared as text, so `"12"` comes before `"7"`. It is
+  deterministic (5.2) and draft 6 makes clear that the order of `id`s is up to the server, but
+  it is surprising; that is why `defaultSort` exists.
 
-## Código y avisos
+## Code and issues
 
-Código y avisos: <https://github.com/restep-spec/restep-server>. Ese repositorio se genera desde la web de
-Restep, donde la herramienta se desarrolla junto a la [especificación](https://restep.wubytes.com/1/) y el servidor de
-referencia: `vendor/` y `schema/` son copias de la web para que las pruebas funcionen solas.
+Code and issues: <https://github.com/restep-spec/restep-server>. That repository is generated from the Restep
+site, where the tool is developed alongside the [specification](https://restep.wubytes.com/1/) and the reference
+server: `vendor/` and `schema/` are copies from the site so the tests run on their own.
 
-Licencia MIT.
+MIT licensed.
