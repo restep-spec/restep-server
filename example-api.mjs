@@ -1,5 +1,5 @@
-// Definición de la API de ejemplo (la librería El Marcapáginas), sin servidor: la usan example.mjs
-// (Node) y la demo publicada en un Worker (projects/restep-demo).
+// Definition of the example API (the El Marcapáginas bookshop), without a server: used by example.mjs
+// (Node) and by the demo published on a Worker (projects/restep-demo).
 import { createRestep, memoryAdapter, memorySingleton, t } from './restep-server.mjs';
 
 export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...more } = {}) {
@@ -14,7 +14,7 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
     collections: {
       books: {
         description: t('Books in the catalogue of El Marcapáginas, one per edition.', 'Libros del catálogo de El Marcapáginas, uno por edición.'),
-        // title, default, examples y labels guían el formulario de alta (4.3); el orden de los campos es el suyo.
+        // title, default, examples and labels guide the create form (4.3); the field order is theirs.
         fields: {
           title: { type: 'string', required: true, title: t('Title', 'Título'), examples: ['La niebla de Portugalete'] },
           price: { type: 'decimal', required: true, title: t('Price', 'Precio'), description: t('In euros, such as "18.50".', 'En euros, como "18.50".') },
@@ -27,7 +27,7 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
           rating: { type: 'number', title: t('Rating', 'Valoración') },
           signed: { type: 'boolean', default: false, title: t('Signed by the author', 'Firmado por el autor') },
         },
-        // 11.1: GET /books:new da el cuerpo de un alta con lo que depende del momento: hoy y este año.
+        // 11.1: GET /books:new gives the body of a create with what depends on the moment: today and this year.
         newItem: () => {
           const today = new Date().toISOString().slice(0, 10);
           return { year: Number(today.slice(0, 4)), published: today };
@@ -35,8 +35,8 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
         filter: { id: ['eq', 'in'], price: ['eq', 'lt', 'le', 'gt', 'ge'], category: ['eq', 'ne', 'in'],
           year: ['eq', 'lt', 'le', 'gt', 'ge'], rating: ['ge', 'null'], published: ['lt', 'ge'],
           reading_time: ['le', 'gt'], signed: ['eq', 'null'] },
-        // 6.1: filtros con nombre, para lo que no es comparar un campo. apply lo usa memoryAdapter;
-        // un adaptador propio recibe { named, value } y lo traduce a su consulta.
+        // 6.1: named filters, for what is not comparing a field. memoryAdapter uses apply;
+        // a custom adapter receives { named, value } and translates it to its query.
         namedFilters: {
           bargain: { description: t('Under 15 euros and rated 4 or more.', 'Por debajo de 15 euros y con un 4 o más.'),
             apply: (r) => Number(r.price) < 15 && (r.rating ?? 0) >= 4 },
@@ -79,11 +79,11 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
         fields: { name: { type: 'string', required: true }, note: 'string', parent: { type: 'relation', to: 'categories' } },
         filter: { id: ['eq', 'in'], name: ['eq'], 'parent.id': ['eq', 'null'] },
         sort: ['id', 'name'],
-        // 5.1: el cliente puede elegir el id (o dejar que lo asigne el servidor); los id usados no vuelven.
+        // 5.1: the client may choose the id (or let the server assign it); used ids do not come back.
         idFrom: 'either',
-        // 6.1: el nombre se filtra y ordena sin distinguir mayúsculas ni acentos.
+        // 6.1: the name is filtered and sorted without regard to case or accents.
         collations: { name: 'server' },
-        // Una regla propia de la API: una categoría no puede ser su propia antecesora.
+        // A rule of the API's own: a category cannot be its own ancestor.
         validate: async (row, ctx) => {
           const id = ctx.current?.id;
           for (let at = row.parent?.id, hops = 0; at && hops < 100; hops++) {
@@ -101,7 +101,7 @@ export function exampleApi({ token = globalThis.process?.env?.RESTEP_TOKEN, ...m
         ]),
       },
     },
-    // 5.9: un singleton, los datos de la tienda.
+    // 5.9: a singleton, the shop's data.
     singletons: {
       shop: {
         description: t('The shop’s own details.', 'Los datos de la propia tienda.'),

@@ -1,13 +1,13 @@
-// Servidor de prueba para pg.test.mjs: un proceso del sistema operativo con su propio pool de
-// conexiones, contra el clúster temporal. Varios a la vez comparten la base de datos.
-//   PGHOST=<directorio del socket> PGPORT=5432x PORT=81xx node pg-worker.mjs
-// Inyección de fallos, solo en este archivo de pruebas, con cabeceras de la petición:
-//   x-test-delay: ms   espera dentro de la transacción: tras insertar (POST) o antes de escribir (PATCH, DELETE)
-//   x-test-fault: throw-after-create   el adaptador inserta y luego lanza (rollback)
-//                 kill-before-commit   SIGKILL a este proceso justo antes de enviar COMMIT
-//                 kill-after-commit    SIGKILL justo después de recibir la confirmación del COMMIT
-//                 lose-commit-ack      el COMMIT llega a PostgreSQL y se confirma, pero la respuesta
-//                                      se pierde: un proxy de socket corta la conexión
+// Test server for pg.test.mjs: an operating system process with its own connection pool,
+// against the temporary cluster. Several at once share the database.
+//   PGHOST=<socket directory> PGPORT=5432x PORT=81xx node pg-worker.mjs
+// Fault injection, only in this test file, with request headers:
+//   x-test-delay: ms   waits inside the transaction: after inserting (POST) or before writing (PATCH, DELETE)
+//   x-test-fault: throw-after-create   the adapter inserts and then throws (rollback)
+//                 kill-before-commit   SIGKILL to this process right before sending COMMIT
+//                 kill-after-commit    SIGKILL right after receiving the COMMIT confirmation
+//                 lose-commit-ack      the COMMIT reaches PostgreSQL and is confirmed, but the response
+//                                      is lost: a socket proxy cuts the connection
 import { createServer as createNet, connect } from 'node:net';
 import { createServer } from 'node:http';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -23,9 +23,9 @@ const fault = () => request.getStore()?.headers.get('x-test-fault') ?? null;
 const delay = () => Number(request.getStore()?.headers.get('x-test-delay') ?? 0);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Proxy de socket Unix delante de PostgreSQL: transparente salvo cuando se arma para perder la
-// respuesta de un COMMIT (el servidor lo procesa; el cliente nunca recibe la confirmación).
-// Dentro del directorio del clúster: se borra con él aunque este proceso muera con SIGKILL.
+// Unix socket proxy in front of PostgreSQL: transparent except when armed to lose the
+// response of a COMMIT (the server processes it; the client never receives the confirmation).
+// Inside the cluster directory: it is deleted with it even if this process dies with SIGKILL.
 const proxyDir = mkdtempSync(join(PGHOST, 'px-'));
 let armed = false;
 createNet((client) => {
@@ -39,8 +39,8 @@ createNet((client) => {
 process.on('exit', () => rmSync(proxyDir, { recursive: true, force: true }));
 
 const real = new pg.Pool({ host: proxyDir, port: Number(PGPORT), user: 'postgres', database: 'postgres', max: 8 });
-real.on('error', () => {}); // conexiones inactivas que caen con un reinicio de PostgreSQL
-// El mismo pool, con los fallos alrededor del COMMIT que envía pgTransaction.
+real.on('error', () => {}); // idle connections that drop when PostgreSQL restarts
+// The same pool, with the faults around the COMMIT that pgTransaction sends.
 const pool = {
   query: (...args) => real.query(...args),
   async connect() {
@@ -75,7 +75,7 @@ const data = (collection) => {
   };
 };
 
-// alice-1 y alice-2 son dos tokens del mismo principal (una credencial renovada).
+// alice-1 and alice-2 are two tokens of the same principal (a renewed credential).
 const principals = { 'alice-1': 'alice', 'alice-2': 'alice', bob: 'bob' };
 const api = createRestep({
   collections: {

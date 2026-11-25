@@ -132,8 +132,8 @@ export function pgIdempotencyStore({ table = 'restep_idempotency' } = {}) {
     },
     async complete(key, response, ctx) {
       const [status, body, headers] = response;
-      // 7.1: la repetición da el mismo cuerpo. jsonb reordena las claves de los objetos, así que el cuerpo se guarda
-      // como texto JSON (body_text), que conserva el orden en que se envió.
+      // 7.1: the repetition gives the same body. jsonb reorders object keys, so the body is stored
+      // as JSON text (body_text), which keeps the order it was sent in.
       const { rowCount } = await needTransaction('complete', ctx).query(`UPDATE ${t} SET response = $2 WHERE scope = $1`,
         [key, JSON.stringify({ status, headers, ...(body !== undefined && { body_text: JSON.stringify(body) }) })]);
       if (rowCount !== 1) throw new Error('restep-server/pg: complete without a reservation');
@@ -143,7 +143,7 @@ export function pgIdempotencyStore({ table = 'restep_idempotency' } = {}) {
     },
   };
 }
-// body: las respuestas guardadas antes de body_text, que ya venían reordenadas por jsonb.
+// body: responses stored before body_text, which already came reordered by jsonb.
 const fromJson = (r) => (r == null ? undefined : [r.status, r.body_text !== undefined ? JSON.parse(r.body_text) : r.body, r.headers]);
 
 // Observability (P0.5): transactions holding an idempotency reservation right now, oldest first.
@@ -186,7 +186,7 @@ export async function purgeExpired(pool, { table = 'restep_idempotency' } = {}) 
 export function pgDocumentAdapter({ pool, collection, table = 'restep_items' }) {
   const t = ident(table);
   const item = (r) => ({ ...r.doc, id: String(r.id) });
-  // 3: los id se comparan punto de código a punto de código: "07" no es el elemento 7, aunque bigint lo leería así.
+  // 3: ids are compared code point by code point: "07" is not item 7, even though bigint would read it that way.
   const validId = (id) => /^(0|[1-9][0-9]{0,17})$/.test(id);
   return {
     async list({ filter, sort, limit, cursor, count }, ctx) {

@@ -1,6 +1,6 @@
-// Clúster temporal de PostgreSQL para las pruebas de pg.test.mjs. Nunca usa una base de datos existente:
-// initdb en un directorio temporal, solo socket Unix en ese directorio (sin TCP), un puerto entre
-// 54320 y 54329 (solo da nombre al socket) y, al terminar, pg_ctl stop y borrado del directorio.
+// Temporary PostgreSQL cluster for the pg.test.mjs tests. It never uses an existing database:
+// initdb in a temporary directory, only a Unix socket in that directory (no TCP), a port between
+// 54320 and 54329 (it only names the socket) and, when finished, pg_ctl stop and deleting the directory.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,10 +9,10 @@ import { createRequire } from 'node:module';
 
 const BINARIES = ['initdb', 'pg_ctl', 'postgres'];
 
-// Carpeta con initdb, pg_ctl y postgres: PG_BIN, pg_config --bindir, el PATH o rutas habituales.
+// Folder with initdb, pg_ctl and postgres: PG_BIN, pg_config --bindir, the PATH or usual locations.
 export function findPgBin() {
   const has = (dir) => dir && BINARIES.every((b) => existsSync(join(dir, b)));
-  if (process.env.PG_BIN) return has(process.env.PG_BIN) ? process.env.PG_BIN : null; // si se fija, solo esa
+  if (process.env.PG_BIN) return has(process.env.PG_BIN) ? process.env.PG_BIN : null; // if set, only that one
   const candidates = [];
   const config = spawnSync('pg_config', ['--bindir'], { encoding: 'utf8' });
   if (config.status === 0) candidates.push(config.stdout.trim());
@@ -24,23 +24,23 @@ export function findPgBin() {
   return candidates.find(has) ?? null;
 }
 
-// Motivo para omitir la suite, o null si se puede ejecutar.
+// Reason to skip the suite, or null if it can run.
 export function pgUnavailable() {
-  if (!findPgBin()) return 'no hay binarios de PostgreSQL (initdb, pg_ctl, postgres); define PG_BIN o instálalos';
-  try { createRequire(import.meta.url).resolve('pg'); } catch { return 'falta el paquete pg; ejecuta npm install en tools/restep-server'; }
+  if (!findPgBin()) return 'no PostgreSQL binaries (initdb, pg_ctl, postgres); set PG_BIN or install them';
+  try { createRequire(import.meta.url).resolve('pg'); } catch { return 'the pg package is missing; run npm install in tools/restep-server'; }
   return null;
 }
 
 export async function startCluster({ ports = [54320, 54329] } = {}) {
   const bin = findPgBin();
-  if (!bin) throw new Error('PostgreSQL no disponible');
+  if (!bin) throw new Error('PostgreSQL not available');
   const dir = mkdtempSync(join(tmpdir(), 'restep-pg-'));
   const data = join(dir, 'data'), log = join(dir, 'log');
   const cleanup = () => {
     spawnSync(join(bin, 'pg_ctl'), ['-D', data, 'stop', '-m', 'immediate', '-w'], { stdio: 'ignore' });
     rmSync(dir, { recursive: true, force: true });
   };
-  process.once('exit', cleanup); // también si la prueba falla o lanza
+  process.once('exit', cleanup); // also if the test fails or throws
   const interrupted = (signal) => () => { cleanup(); process.exit(128 + (signal === 'SIGINT' ? 2 : 15)); };
   const handlers = ['SIGINT', 'SIGTERM'].map((s) => [s, interrupted(s)]);
   for (const [s, h] of handlers) process.once(s, h);
@@ -53,11 +53,11 @@ export async function startCluster({ ports = [54320, 54329] } = {}) {
       const r = spawnSync(join(bin, 'pg_ctl'), ['-D', data, '-l', log, '-w', '-t', '30', '-o', `-p ${p} -k ${dir} -c listen_addresses=''`, 'start'], { encoding: 'utf8' });
       if (r.status === 0) port = p;
     }
-    if (!port) throw new Error(`no se pudo arrancar PostgreSQL en ${ports.join('-')}`);
+    if (!port) throw new Error(`could not start PostgreSQL on ${ports.join('-')}`);
     const ctl = (...args) => execFileSync(join(bin, 'pg_ctl'), ['-D', data, '-l', log, '-w', '-t', '30', ...args], { stdio: 'ignore' });
     return {
       host: dir, port, dir,
-      // Caída sin apagado limpio (como un corte): al arrancar, PostgreSQL se recupera desde el WAL.
+      // Crash without a clean shutdown (like a power cut): on start, PostgreSQL recovers from the WAL.
       crash() { ctl('stop', '-m', 'immediate'); },
       start() { ctl('-o', `-p ${port} -k ${dir} -c listen_addresses=''`, 'start'); },
       stop() { forget(); cleanup(); },

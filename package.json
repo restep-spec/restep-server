@@ -1,6 +1,6 @@
 {
   "name": "restep-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Server library for Restep 1 APIs: you write the data access",
   "license": "MIT",
   "files": [

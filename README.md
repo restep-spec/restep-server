@@ -1,7 +1,7 @@
 # restep-server (prototype)
 
-A library for writing a [Restep 1](https://restep.wubytes.com/1/) server (draft 6: discovery
-declares `"restep": "1.0-draft.6"`) without implementing the protocol by hand: you declare the collections and write the access to your data;
+A library for writing a [Restep 1](https://w3id.org/restep/1/) server (draft 7: discovery
+declares `"restep": "1.0-draft.7"`) without implementing the protocol by hand: you declare the collections and write the access to your data;
 the library does the rest. One file, Node 18+, no dependencies.
 
 The core only uses the standard Web APIs (`Request`, `Response`, `URL`, Web Crypto):
@@ -50,9 +50,10 @@ npx restep-check http://localhost:8810/ --writes      # 0 failed
 
 ## Your part: the data adapter
 
-Each collection takes in `data` an object with these methods. `list` and `get` are required; the
-rest are optional and, if missing, their HTTP method disappears from the collection (`methods`,
-`item_methods` and the `Allow` of `405` responses are computed for you).
+Each collection takes in `data` an object with these methods. `get` is required; the rest are
+optional and, if missing, their HTTP method disappears from the collection (`methods`,
+`item_methods` and the `Allow` of `405` responses are computed for you). A collection without `list`
+has no `GET` (4.3): it declares no `filter`, `namedFilters`, `sort` or `count`.
 
 | Method | Receives | Returns |
 |---|---|---|
@@ -61,11 +62,23 @@ rest are optional and, if missing, their HTTP method disappears from the collect
 | `create(data, ctx)` | the already validated body, without `_` members; with `id` only if the client chose it (`idFrom`) | the saved item, with its `id` (the client's, if it chose one) |
 | `update(id, data, ctx)` | the full item, already merged and validated (`ctx.patch`: the patch; `ctx.current`: the previous state). Not called if the `PATCH` changes no data (5.1) | the saved item |
 | `delete(id, ctx)` | the `id` | nothing |
-| `taken(id, ctx)` | a client-chosen `id`; only with `idFrom: 'client'` or `'either'`, where it is required | `true` if the collection has or had that `id`, whether this principal can see it or not (5.1) |
+| `taken(id, ctx)` | a client-chosen `id`; only with `idFrom: 'client'` or `'either'`, where it is required | `true` if the collection has or had that `id`, whether this principal can see it or not (5.1); with `reusableIds`, only whether an item has it now |
+| `upload(file, ctx)` | with `upload` (5.1): `{ bytes, mediaType, filename, size }` of a file the client sent instead of JSON | the saved item, with its `id` and `_content: { href, media_type, size }`; `href` is the link to the bytes, a resource outside Restep that you serve |
 
 - `filter` is a list of `{ field, op, value, type }` with the value already converted to its type (an
-  `in` brings a list; a `null`, a boolean). `sort` is `[{ field, desc, type }]` and always
-  ends in `id`, as a tiebreaker. `field` can be `field`, `map.tag` or `relation.id`.
+  `in` or `nin` brings a list; a `null`, a boolean). `op` is one of the eleven of 6.1: `eq`, `ne`,
+  `lt`, `le`, `gt`, `ge`, `in`, `nin`, `null`, `prefix` and `contains`. `sort` is `[{ field, desc, type }]`
+  and always ends in `id`, as a tiebreaker. `field` can be `field`, `map.tag` or `relation.id`.
+- A filter or sort key on a localized field (`{ type: 'localized', source }`, 3) carries
+  `localized: { source, language }`: compare the text of the `source` map in that language (and
+  `read(row)`, which `memoryAdapter` uses).
+- The filters on one to-many relationship or list field (declared with `quantifier: 'some'`, 6.1)
+  arrive together as one group, `{ group, kind, filters, null }`: `kind` is `'relation'` (each filter's
+  `field` is relative to the related item, such as `id`) or `'list'` (`field` is `''`, the element
+  itself). The item matches when some element matches all of `filters`; `null: true` negates the
+  group (no element at all if `filters` is empty), `null: false` asks for some element. A sort key on
+  such a path carries `group`, `kind` and `sub`: ascending by the least value, descending by the
+  greatest, items without any last (6.2). `matches` and `sorter` do all of this in memory.
 - A named filter (`namedFilters`, 6.1) arrives in `filter` as `{ named, value }`: `value` is
   `true` for a switch, and the already converted value for one with `type`. Your adapter translates it by its
   name (an ORM scope, a subquery, a text search). `memoryAdapter` uses the `apply`
@@ -77,7 +90,13 @@ rest are optional and, if missing, their HTTP method disappears from the collect
 - `fields` is only a hint: you may return whole items. If the collection has `update`
   or `delete`, it arrives as `null`, because the `_etag` of each listed item is computed over the
   full representation.
-- `ctx` carries `request`, `principal`, `lang` and `collection`.
+- `ctx` carries `request`, `principal`, `actor` (when someone acts on the principal's behalf, 2),
+  `lang` and `collection`; a singleton with `parent` also gets `ids` (the template's variables, such as
+  `{ reader_id: 'r1' }`), and the `new` action gets `params`.
+- With `reusableIds` (5.1), an item that takes back the `id` of a deleted one is a new incarnation and
+  its item ETag must differ from the earlier ones' (7.2): return in each row an `_incarnation` member
+  (any JSON value that differs per incarnation: a creation timestamp, a sequence). It counts towards
+  the ETag and never reaches the representation. `memoryAdapter` does it for you.
 - `get` compares the `id` code point by code point (3): `07` is not `7`. If your key is
   numeric, do not turn `"07"` into `7` (the library gives `404` anyway if the item you
   return has a different `id`). `get` also returns `null` for an item this principal cannot
@@ -103,11 +122,14 @@ rest are optional and, if missing, their HTTP method disappears from the collect
 
 ## What the library does
 
-- **Discovery (1.1, 4.2, 4.3)**: `"restep": "1.0-draft.6"`, profiles (`core`, `query`,
-  `writes` if there are writes, `cache`), `idempotency` (with `anonymous: false` if asked), `status`,
-  collections with `description`, `methods`, `item_methods`, `id_from`, `filter` with types and
-  operators, `sort`, `collations`, `max_limit`, `count`, `language_maps`, `relations` and
-  `item`, `create` and `update` JSON Schemas generated from the fields, and `singletons`. The
+- **Discovery (1.1, 4.2, 4.3)**: `"restep": "1.0-draft.7"`, `default_language` (with localized
+  fields), profiles (`core`, `query`, `writes` if there are writes, `cache`), `idempotency` (with
+  `anonymous: false` if asked), `status`, collections with `description`, `methods`, `item_methods`,
+  `method_effects`, `item_method_effects`, `id_from`, `reusable_ids`, `upsert`, `upload`, `filter` with
+  types, operators, `quantifier` and `required`, `named_filters` with `default` and `required`, `sort`,
+  `collations`, `max_limit`, `count`, `language_maps`, `localized`, `relations` (with `many` and
+  `media_types`), the `new` action with `params` and `output`, and `item`, `create` and `update` JSON
+  Schemas generated from the fields, and `singletons` (with `parent`). The
   same document for every principal (only the texts change, with `Accept-Language`), with
   `ETag`, `304` and `Vary: Accept-Language`; `private` when there is a principal. It adds no custom members.
 - **Names (3)**: at startup it rejects collections, singletons, fields and named filters that do not
@@ -118,12 +140,37 @@ rest are optional and, if missing, their HTTP method disappears from the collect
 - **Parameters (5.3, 6)**: rejects every reserved parameter the resource does not implement for that
   method (`unsupported_parameter`) and every wrong value (`invalid_parameter`), always with
   `parameter`: undeclared filters and operators, types, empty `in`, the same filter twice
-  (also `filter[f]` with `filter[f][eq]`), durations with years or months, `limit` out of range,
+  (also `filter[f]` with `filter[f][eq]`), two `null` filters on one to-many relationship or list
+  field (its own or through a path, 6.1), an `integer` or `number` operand that is not `0` and has a
+  magnitude below `1e-300` or above `1e300` (the library's limit, named in `detail`; within it, the
+  operand is compared as a number even outside the field's range), durations with years or months, `limit` out of range,
   `fields` entries that do not exist or reach into a language map, tampered cursors or cursors from
   another query, repeated parameters, `$whatever`.
-- **Errors (5.4)**: `problem+json` with `type`, `title`, `status`, `code` and `detail`, in the order
-  of draft 6: `401`/`403` → `404` → `405` → `400` for parameters and headers → `400` for the body,
-  `415` and `413` → replay and `409 request_in_progress` → `428` → `412` → `422` → `409 conflict`.
+- **Errors (5.4)**: `problem+json` with `type`, `title`, `status`, `code` and `detail`. The table of
+  codes is closed: `RestepError` refuses (as a `500`) a code that does not go with its status, and a
+  status the table does not list gets `http_` and its three digits (`new RestepError(418)` →
+  `http_418`). Every problem carries `Cache-Control: no-store`, whatever your headers say, and no field
+  aimed at shared caches (`CDN-Cache-Control`, `Surrogate-Control`), which the library also drops from
+  every response with a principal. The order keeps the precedences of draft 7: the same request against
+  the same state gets the same error; `401`/`403` → `404` → `405` → `400` for parameters and headers →
+  `400` for the body, `415` and `413` → replay and `409 request_in_progress` → `428` → `412` → `422` →
+  `409 conflict`. A method the server does not know at all gets `501 not_implemented` (5.1).
+- **I-JSON (3)**: a body that repeats a member name gives `400 bad_request` with the member's
+  `pointer`; an unpaired surrogate or a noncharacter, `422 invalid` with a `format` entry whose `pointer`
+  is the string that holds it, or `""` when that string is a member name. A body that is not JSON gives `400
+  bad_request` even if it also has one (3, 5.4).
+- **Types (3, 6.1)**: also `localdatetime`, `timezone` (an IANA name) and `list` (of a scalar type,
+  `items`). Instants, local date-times and durations are written in uppercase and accepted in
+  lowercase; durations follow the grammar of 3, with up to nine decimals only in the seconds, and
+  compare exactly in nanoseconds. A filter value with a leap second (`:60`) gives `invalid_parameter`,
+  and an instant or a local date-time with one in a body, `422 invalid` with a `format` entry (3),
+  except in a server-only field of a `POST`, which is ignored whatever its value; a `datetime` or
+  `localdatetime` default with one is a configuration error. `integer` and `number` operands, and those
+  of `GET` action parameters (each element of a list too), follow the `number` grammar of RFC 8259
+  (`2e1` is `20`; `+20`, `.5`, `020` and `0x14` give `invalid_parameter`); `decimal` keeps its own. An
+  integer out of range compares as a number; operands equal under the type (`20`, `20.0`, `2e1`) are the
+  same filter, also for the cursor, so `20.0` is a valid operand of an `integer` field and `20.5` gives
+  `invalid_parameter` (6.1, 11.1).
 - **Writes (3, 5.1, 7)**: `Content-Type: application/json` required (for `PATCH`, also
   `application/merge-patch+json`), with `utf-8` as the only `charset`: any other type, another `charset`
   or none gives `415` (with `Accept-Patch` on a `PATCH`), and an empty body with `application/json`
@@ -136,18 +183,57 @@ rest are optional and, if missing, their HTTP method disappears from the collect
 - **`id` (5.1)**: with `idFrom` undeclared or `'server'`, an `id` in the `POST` gives `422` with
   `read_only` at `/id`. With `'client'` (mandatory, `required` if missing) or `'either'`
   (optional), it validates it (`type`, `format`, and `idPattern` if you give one) and gives `409 conflict`
-  with `taken` at `/id` for one the collection has or had, after the `422`s.
+  with `taken` at `/id` for one the collection has or had, after the `422`s. With `reusableIds: true`
+  (only with `'client'`), the `id` of a deleted item is free again and a `POST` with it creates a new
+  incarnation, with another item ETag.
+- **`upsert` (5.1)**: with `upsert: true` (`'client'` or `'either'`), a `PATCH` to a free `id` applies the
+  merge patch to `{}`, validates it as a `POST` and answers `201` with `Location`; `If-Match` gives `412`
+  there and `If-None-Match: *` lets it create; the `id` of a deleted item (not free without
+  `reusableIds`) gives `404`. With `requireIfMatch` too, `If-None-Match: *` meets the requirement: it
+  creates the item if its `id` is free and gives `412` if it is not; a `PATCH` with neither header gives
+  `428` (7.2).
+- **Read-only fields (5.1, 4.3)**: `readOnly: true` on a field only the server sets (`created_at`, a
+  total), that is, one no client can set directly, neither in a `POST` nor in a `PATCH`: a `POST`
+  ignores it whatever its value, a `PATCH` ignores it with its current value (compared under its type)
+  and gives `422 read_only` with another. It is `readOnly` in the `item` schema and absent from `create`
+  and `update`; that is how the library publishes it, but per 5.1 a client cannot infer the field is
+  server-only from those annotations. Do not use it for a field some clients can set: that is your
+  adapter's and `validate`'s job.
+- **Uploads (5.1)**: `upload: { mediaTypes: ['image/*', 'application/pdf'], maxSize, multipart }` and
+  `data.upload(file, ctx)`. A `POST` with the bytes of a declared media type (`*` matches any subtype,
+  `*/*` any type) creates the item; another type gives `415`, a larger file `413`, and with
+  `multipart: true`, `multipart/form-data` with exactly one part named `file` works too (anything
+  else, `415`); the part's `filename` is optional (`file.filename` is then `undefined`). Without
+  `multipart: true`, an outer `multipart/form-data` gives `415`, even when `mediaTypes` match it
+  (`multipart/*` or `*/*`). Without `data.create`, the collection only takes uploads: a JSON body
+  gives `415`, unless `mediaTypes` admit `application/json` (also as `application/*` or `*/*`),
+  which makes it an upload. A `+json` type, such as `application/ld+json`, is a file like any other:
+  only `application/json` selects creation from JSON. With `data.create` too, a `POST` with
+  `application/json` is always an item creation, so a JSON file only comes as the `file` part of
+  `multipart/form-data`: `mediaTypes` that admit `application/json` (also as `application/*` or `*/*`) without
+  `multipart: true` are a configuration error. Removing `data.create` from a collection that keeps
+  `upload` is a breaking change (5.5). Every `415` of such a collection carries
+  `Accept-Post` with the media types it accepts (`application/json` only with `data.create`). Such a
+  collection publishes no `create` schema, since it has no JSON body to describe (restep-check reads
+  that as "does not create items from JSON"), and CORS
+  exposes `Accept-Post`. For
+  idempotency, the same request is the same bytes and media type. A relation to such a collection can
+  carry `mediaTypes`, and then a file of another type gives `422` with `format` at its `id`.
 - **Concurrency (7.2)**: strong ETag of the full item, computed without `_etag`; `_etag` in every
   response whose body is an item (its `GET`, with or without `fields`, the `201` of the `POST` and the `200`
   of the `PATCH`) and in each item of a listing when it allows `PATCH` or `DELETE` (the same ETag as
   its `GET`, computed over the full representation even with `fields`), `If-Match`
   (lists, `*`, strong comparison) evaluated atomically with the write within the process
   and, with `createTransaction` and `ctx.forUpdate`, across processes,
-  `If-None-Match` (`304` on reads, `412` on writes) and `428` with `requireIfMatch: true`.
+  `If-None-Match` (`304` on reads, `412` on writes) and `428` with `requireIfMatch: true` (an
+  `If-None-Match` with a list of tags does not meet it; only `*`, with `upsert`, does).
 - **Idempotency (7.1)**: `Idempotency-Key` as a Structured Fields string without parameters (a
   malformed one gives `400 bad_request` with a `header` entry), per principal and target (method and
   decoded path, without the query); two requests are the same if, in addition, their query (after
-  decoding, in any order) and their bodies as JSON values match. Replay with `Idempotent-Replayed: true`,
+  decoding, in any order) and their bodies as JSON values match. Replay with `Idempotent-Replayed: true`
+(its body is the item's current representation with its current ETag and `_etag`; a stored body that is
+not, which the library only keeps when the item has no `id` to reload, goes without `ETag`, `_etag` or
+`Content-Location`),
   `422 idempotency_mismatch` (also while the first one is still in progress), `409
   request_in_progress` with `Retry-After` for the same request while the first is still in progress, `400
   idempotency_key_required` with `requireIdempotencyKey: true`. A rejected request does not use up the key.
@@ -160,19 +246,48 @@ rest are optional and, if missing, their HTTP method disappears from the collect
   `Cache-Group-Invalidation` on writes. A response with a principal is `private` even
   without this profile (5.1).
 - **Singletons (5.9)**: `singletons: { me: { path, description, fields, data } }` with `data.get(ctx)`
-  and, for `PATCH`, `data.update(merged, ctx)`. `GET`/`HEAD` with `fields`, ETag, `_etag` and `304`;
+  and, for `PATCH`, `data.update(merged, ctx)`. With `parent`, a singleton hangs from an item
+  (`{ parent: 'readers', path: '/readers/{reader_id}/settings' }`) or from another singleton; it gives
+  `404` under an item that does not exist, and its adapter gets the ids in `ctx.ids`. `GET`/`HEAD` with `fields`, ETag, `_etag` and `304`;
   `PATCH` like an item's (validation, `If-Match`, `428` with `requireIfMatch`, no write when nothing
-  changes); `POST` and `DELETE` give `405`; `include` and the other reserved parameters,
+  changes); `methodEffects: { PATCH: [] }` declares the effects of that `PATCH` in discovery (4.3; an
+  undeclared one counts as all three); `POST` and `DELETE` give `405`; `include` and the other reserved parameters,
   `unsupported_parameter`. Relations carry `href`. No `id`, no language maps, no actions.
 - **Origin (5.8)**: a `POST`, `PATCH` or `DELETE` authenticated with credentials the browser
   adds on its own, whose `Origin` is neither the API's nor one of `cors.origins`, gives `403 forbidden` with no
   effect (`Origin: null` is fine with `Sec-Fetch-Site: same-origin`; without `Origin`,
   `Sec-Fetch-Site` decides). See `browserCredentials`.
 - **Language (5.6)**: the library's texts (errors, descriptions) in English and Spanish,
-  chosen with RFC 4647 *lookup*; yours can be `t('en', 'es')`. Data never changes.
+  chosen with RFC 4647 *lookup*; yours can be `t('en', 'es')`. Data never changes, except localized
+  fields.
+- **Localized fields (3, 5.6, 6.1, 7.2)**: `name: { type: 'localized', source: 'name_i18n' }` is the
+  text of the `name_i18n` language map in the response language (or, where the map lacks it, that of
+  a regional variant such as `es-es` for `es`; otherwise `null`). Discovery declares `localized` and
+  `default_language`; responses carry `Vary: Accept-Language` and `Content-Language`; filters and sorts
+  on it use the response language, and so does the cursor; the item ETag differs by language and
+  `If-Match` succeeds with that of any language. It is read-only: sent back with its text in any
+  language it is ignored, with another value it gives `422 read_only`.
 - **Language maps (3)**: tag validation (`format`), types and unsupported tags
   (`unknown`, with the `languageTags` option), filtering and sorting by exact `field.tag`.
 - **Service status (4.4)** with `status: { path: '/health', check: async () => true }`.
+- **Filters (6.1)**: besides the operators, `filter: { isbn: { ops: ['eq'], required: true } }` (a list
+  request without it gives `invalid_parameter` naming `filter[isbn]`), named switches with
+  `default: true` (they apply unless the request sends `filter[name]=false`, never to an item read by
+  its path; the cursor is bound to the ones that stay on) or `required: true`, and to-many filters
+  with `quantifier: 'some'` on a `list` field or on `relation.id` of a `{ type: 'relation', to, many: true }`
+  field (the relation itself can declare only `null`). With `null` as its only operator, the relation
+  or the list field itself may omit `quantifier` (`tags: ['null']`) or declare `'some'`, which select the
+  same, and discovery gives it the type of the related items' `id` (`string`) or of the elements. `null`
+  tests the whole relation or list, never an element: alone, `true` is empty, absent or `null`; with `in`
+  or other filters of the group, `true` is "no element matches them" and `false` "some does" (6.1). `prefix` and `contains` only on string fields and
+  translations, never on `id`; with the `"server"` collation, `memoryAdapter` matches them without case
+  or accents, as its `eq`.
+- **Replays (7.1)**: the same status and `Location`; the body, when the first one had one, is the item's
+  current representation, with its current ETag, so it never gives more than a read would now; without
+  the item, no body and no ETag. A replay of a `201` without body (`return=minimal`) carries no ETag even
+  if the item exists: the client reads it at `Location` (7.3).
+- **Principal and actor (2)**: `authenticate` and `verifyToken` may return `{ principal, actor }`; an
+  acting principal and the one it represents never share idempotency keys or cursors.
 - **oauth (11.5)** with `oauth: { authorizationServers, scopesSupported, verifyToken(token, request) }`:
   RFC 9728 metadata at its URL, `WWW-Authenticate` challenges with `resource_metadata` only at the root.
   Without oauth, `authenticate(request)` can return a principal or throw a 401/403 `RestepError`.
@@ -181,8 +296,8 @@ rest are optional and, if missing, their HTTP method disappears from the collect
 
 | Option | Default | Purpose |
 |---|---|---|
-| `collections` | (required) | `{ name: { fields, filter, namedFilters, sort, defaultSort, collations, maxLimit, defaultLimit, count, path, description, idFrom, idPattern, validate, newItem, requireIfMatch, requireIdempotencyKey, data } }`. `collations`: `{ field: 'codepoint' \| 'server' }` (6.1), only `string` fields (or `field.tag`) in `filter` or `sort`, never `id`. `idFrom`: `'server'`, `'client'` or `'either'` (5.1). `idPattern`: regular expression that restricts the client's `id`, also in the `create` schema |
-| `singletons` | — | `{ name: { path, description, fields, validate, requireIfMatch, data } }` (5.9) |
+| `collections` | (required) | `{ name: { fields, filter, namedFilters, sort, defaultSort, collations, maxLimit, defaultLimit, count, path, description, idFrom, idPattern, reusableIds, upsert, upload, methodEffects, itemMethodEffects, validate, newItem, newParams, newSchema, requireIfMatch, requireIdempotencyKey, data } }`. `collations`: `{ field: 'codepoint' \| 'server' }` (6.1), only `string` fields (or `field.tag`) in `filter`, sort keys that hold strings or localized fields, never `id`. `idFrom`: `'server'`, `'client'` or `'either'` (5.1). `idPattern`: regular expression that restricts the client's `id`, also in the `create` schema. `methodEffects` and `itemMethodEffects`: `{ POST: ['external'], DELETE: [] }`, the effects of the unsafe methods (4.3, 11.1): `destroys`, `external`, `charges` |
+| `singletons` | — | `{ name: { path, parent, description, fields, validate, requireIfMatch, methodEffects, data } }` (5.9). `methodEffects`: `{ PATCH: [...] }`, the only key it takes (4.3) |
 | `base` | `''` | Path of the API root, such as `/api` |
 | `version` | `'1'` | The `version` of the discovery document: your API's major version, the one in its path (`/v2/` → `'2'`, 5.5) |
 | `languages` | `['en', 'es']` | Languages of the texts; the first one is the default |
@@ -201,8 +316,10 @@ rest are optional and, if missing, their HTTP method disappears from the collect
 | `onError` | `console.error` | Receives the exceptions that end in `500` |
 
 The field types are those of discovery (`string`, `integer`, `number`, `decimal`,
-`boolean`, `date`, `datetime`, `duration`, `enum` with `values`) plus `map` (language map) and
-`relation` (to-one, with `to`). A field can carry `required: true` and `description`. `validate(row,
+`boolean`, `date`, `datetime`, `localdatetime`, `timezone`, `duration`, `enum` with `values`) plus `map`
+(language map), `localized` (with `source`), `list` (with `items`, a scalar type) and `relation` (with
+`to`; `many: true` for a to-many list; `mediaTypes` towards a collection with `upload`). A field can
+carry `required: true`, `readOnly: true` and `description`. `validate(row,
 ctx)` returns a list of `errors` entries for custom rules (see the cycle rule in the example).
 Field names follow the grammar of 3; one that does not will not start.
 
@@ -220,10 +337,17 @@ With these options, the `create` schema guides a client that renders a creation 
 
 Fields come out in the order they are declared in `fields`, which is the order they are shown in.
 
-For what depends on the client or the moment (today's date, their shop), `newItem: (ctx) => body`
-adds the action `GET /collection:new` (`actions` extension, 11.1). It returns the `default`s and, on top,
-whatever `newItem` returns, with `Cache-Control: private, no-store`, and creates nothing. It is the trial that
-the spec's future work cites (Appendix B), so it may change.
+For what depends on the client or the moment (today's date, their shop), `newItem: (ctx) => values`
+adds the action `GET /collection:new` (`actions` extension, 11.1), declared `on` the collection, safe,
+idempotent and with `"method": "GET"`. It answers `{ values, schema }`: `values` are the `default`s and,
+on top, whatever `newItem` returns; `schema` is the collection's `create` schema, which
+`newSchema: (ctx, schema) => schema` may restrict but never widen. With `newParams: { kind: { type:
+'enum', values: [...], required, list, description } }` the action declares its query parameters,
+which arrive parsed in `ctx.params` (an undeclared one gives `unsupported_parameter`, a wrong value,
+a missing required one, an empty list or a repeat, `invalid_parameter`). Without `newParams` the action
+takes no query parameters, as if it declared `"params": {}`: any one gives `400 unsupported_parameter`
+(5.3, 11.1). It is served with
+`Cache-Control: private, no-store` and creates nothing.
 
 ## Framework adapters
 
@@ -245,22 +369,55 @@ collection or singleton writes), `actions` (if there is `newItem`) and `oauth` (
 
 | Profile or extension | Status |
 |---|---|
-| `core` | Yes, except deprecations (`deprecations`, `Deprecation`, `Sunset`, 5.5), custom read-only fields (only `id` is one), `406` for `Accept` (it always answers JSON) and major versions (`/v2/`) |
+| `core` | Yes, except deprecations (`deprecations`, `Deprecation`, `Sunset`, 5.5), `406` for `Accept` (it always answers JSON), major versions (`/v2/`) and fields that are read-only for some principals only (your adapter and `validate`) |
 | `query` | Yes. `"server"` collations and fields a principal cannot read are handled by your adapter |
 | `writes` | Yes. With several instances or persistence, only with a transactional adapter such as the PostgreSQL one ([`pg.mjs`](#postgresql)); the library's own `If-Match` lock only coordinates one process |
 | `cache` | Yes (since draft 6 it is a separate profile; the library already did what it asks) |
 | `oauth` | Yes, without per-request scopes: a `403 insufficient_scope` is thrown by your `verifyToken` or your adapter |
-| `relations` | No: it does not announce the profile, does no `include`, and has no subcollections (`path` with a template and `parent`). To-one relations are declared, validated and filterable by `relation.id` |
+| `relations` | No: it does not announce the profile, does no `include`, and has no subcollections (`path` with a template and `parent`). Relations (to-one, and to-many with `many: true`) are declared, validated and filterable by `relation.id` |
 | `sync` | No: no collection declares `sync` and `:changes` gives `404` |
-| `actions` | Only the `new` action of collections with `newItem`; any other path with a colon gives `404` |
+| `actions` | Only the `new` action of collections with `newItem` (with `params` and `output`); any other path with a colon gives `404`. No other actions, so no `effects`, `input` or `_actions` on items, and no actions on singletons |
 | `inherit` | No: it neither announces it nor declares `inherit` |
 | `batch`, `filter-expr`, `query-method` | No: their parameters and paths fail loudly (`unsupported_parameter`, `404`) |
+
+### Draft 7, rule by rule
+
+| Rule (draft 7) | Where |
+|---|---|
+| `"restep": "1.0-draft.7"` (1.1) | Library |
+| Precedences instead of a total order of errors (5.4) | Library: its order is one of those the precedences allow; replays and `409 request_in_progress` go before `428` and `412`, also when the item is gone |
+| Closed table of codes, `http_NNN`, `no-store` and no CDN fields on `428`, `429`, `431`, `511` (5.4) | Library (`RestepError` checks the code; every problem is `no-store`) |
+| Principal with its actor (2) | Library, if your `authenticate` or `verifyToken` returns `{ principal, actor }` |
+| I-JSON bodies (3) | Library: `400` for repeated names, `422` for unpaired surrogates and noncharacters |
+| Uppercase instants and durations, lowercase accepted; fractions of a second; `localdatetime`, `timezone` (3) | Library |
+| Segment that does not decode to UTF-8 → `404` (3) | Library |
+| Localized fields and `default_language` (3, 5.6, 6.1, 6.4, 7.2) | Library (`type: 'localized'`) |
+| Collections without `GET`; `Allow` with `HEAD` only beside `GET` (4.3) | Library (an adapter without `list`) |
+| `method_effects`, `item_method_effects` (4.3) | Library (`methodEffects`, `itemMethodEffects`) |
+| A `default` valid against its property (4.3) | Library, at startup |
+| `422` for a JSON value that is not an object (4.3, 5.1) | Library |
+| No CDN fields on responses that depend on credentials (5.1) | Library drops them when there is a principal |
+| Server-set fields ignored in a `POST` (5.1) | Library (`readOnly: true`) |
+| `reusable_ids`, `upsert`, `upload` (5.1) | Library, with the adapter's `taken`, `create`, `update` and `upload` |
+| `Deprecation` and `deprecations` (5.5) | Not implemented |
+| Operators `nin`, `prefix`, `contains`; empty element in `in`; out-of-range numbers; leap seconds; equal operands (6.1) | Library |
+| Default and required filters; cursor bound to the default filters left on and to the language (6.1, 6.4) | Library |
+| To-many filters with `quantifier` and their sort (6.1, 6.2) | Library: `list` fields and `relation.id` of to-many relations; paths into related items (`reviews.rating`) need `include`, which it does not do |
+| Replay with the same status and `Location`, never more than a read (7.1) | Library: the current representation |
+| `_etag` with its quotes; ETag by language; `If-Match` in any language (7.2) | Library |
+| `ETag` with a content coding differs from the item ETag or is weak (7.2) | The library does not compress; a layer in front that does (gzip) must weaken or change the `ETag` header, as most do. `_etag` keeps the item ETag |
+| `*` on a `POST` to a collection depends on whether it can be read (7.2) | Library |
+| `QUERY` (8, 11.4) | Not implemented: `405` |
+| Singletons under an item or another singleton (5.9) | Library (`parent`); actions on singletons: not implemented |
+| `new` action with `{ values, schema }`, `params` and `output` (11.1) | Library |
+| `Content-Location` after an action, `effects` of actions, colon unencoded in links (11.1) | Does not apply: the only action is `new`, safe |
+| oauth: `https` API root, `realm` in every challenge (11.5) | `realm` always; the root takes the scheme of `publicOrigin` or the request, so serve it over `https` |
 
 ### Draft 6, rule by rule
 
 | Rule (draft 6) | Where |
 |---|---|
-| `"restep": "1.0-draft.6"` (1.1) | Library |
+| A draft declares itself with its suffix in `restep` (1.1) | Library |
 | Stable or experimental status (1.2) | Does not apply: it announces no experimental part |
 | `cache` separate from `writes`; `private` on every response with credentials (5.1, 8) | Library: announces `cache`; `private` when there is a principal. Making your `authenticate` return a principal for every request with credentials is up to you |
 | `inherit` as an extension (11.6) | Not implemented, not announced |
@@ -352,7 +509,7 @@ const api = createRestep({
 | `schema(opts)`, `migrate(pool, opts)` | The SQL for the tables (below) and running it. `opts`: `idempotencyTable`, `itemsTable` |
 | `pgTransaction(pool)` | The `createTransaction`: `BEGIN`, the work on one connection, `COMMIT`; `ROLLBACK` if it fails. A failed `COMMIT` (dropped connection, lost acknowledgement) gives `500` and is not retried: the client's retry with the same key resolves it by reading the database |
 | `pgIdempotencyStore({ table })` | The key store. Requires `ctx.transaction` |
-| `pgDocumentAdapter({ pool, collection, table })` | A data adapter that stores each item as `jsonb`, with `id`s from a sequence (`bigserial`: never reused, and `07` is not `7`). It has no `taken`, so it does not support `idFrom: 'client'` or `'either'`. It writes in the transaction and locks with `ctx.forUpdate`. `list` filters and sorts in the process with the library's rules: fine for tests and small collections; for large ones, write your own SQL adapter following the same contract |
+| `pgDocumentAdapter({ pool, collection, table })` | A data adapter that stores each item as `jsonb`, with `id`s from a sequence (`bigserial`: never reused, and `07` is not `7`). It has no `taken` or `upload`, so it does not support `idFrom: 'client'` or `'either'`, `reusableIds`, `upsert` or `upload`. It writes in the transaction and locks with `ctx.forUpdate`. `list` filters and sorts in the process with the library's rules: fine for tests and small collections; for large ones, write your own SQL adapter following the same contract |
 | `inFlightReservations(pool)` | The transactions currently holding a reserved key: `pid`, `state`, `age_ms`, `xact_start`, `application_name`, `client_addr`, `wait_event` |
 | `terminateReservation(pool, pid)` | Terminates the backend of a stuck reservation and waits for it to disappear. Rejects (`false`) a `pid` that has no reservation |
 | `purgeExpired(pool, { table })` | Deletes the stored responses whose time has passed |
@@ -441,13 +598,17 @@ node tools/restep-server/test.mjs
 node --test tools/restep-server/pg.test.mjs   # needs PostgreSQL and npm install in tools/restep-server
 ```
 
-They start the example on ports 8810 and 8811 (the latter with oauth) and run
-`restep-check --writes` (0.7.0, draft 6) against it, which must report 0 failures; then they test
+They start the example on free random ports (the second one with oauth) and run
+`restep-check --writes` against it, which must report 0 failures; then they test
 `handle(Request)` directly (error order, idempotency with a request in progress, `428`,
 language, `base`, adapter errors, wrong configuration and, from draft 6, `415` and `charset`,
 `_etag`, the query in idempotency, `idempotencyAnonymous`, `idFrom` and `taken`, decoded
 paths, `+` as space, collations, relations set to their current value, singletons,
-name grammar and `Origin`) and the Express (port 8813) and Hono adapters.
+name grammar and `Origin`; from draft 7, the closed table of codes, `501`, collections without `GET`,
+effects, I-JSON, instants and durations, the new operators, equal operands in the cursor, default and
+required filters, to-many filters, localized fields, `readOnly`, `reusableIds`, `upsert`, singletons with
+`parent`, uploads, the `new` action's `params` and schema, the actor and replays) and the Express (on a
+free random port) and Hono adapters.
 
 `pg.test.mjs` creates a temporary cluster (`initdb` in a temporary directory, Unix socket only,
 port 54320-54329; stopped and deleted at the end, also on failure) and starts two server
@@ -478,9 +639,13 @@ item gives `404` (7.2), idempotency without credentials can be rejected with `"a
   `authenticate` used, so `'auto'` infers it from the headers (`Cookie`, `Basic`, `Digest`). With
   non-authenticating cookies next to a token in `Authorization`, `'auto'` may reject a
   cross-origin write that the specification does not cover; set `browserCredentials: false`.
-- **"The value the item would have"** (5.1, read-only fields on a `POST`): the library
-  cannot know it before the adapter creates the item, which is why it offers no custom read-only
-  fields.
+- **"The value the item would have"** (5.1, read-only fields on a `POST`): draft 7 has a `POST` ignore
+  whatever value a field only the server sets carries (`readOnly: true`). For a localized field the
+  library cannot know the text the item would get before it exists, so it takes the text of the
+  body's `source` map in any language it offers.
+- **The `null` of a to-many relationship itself** (6.1): settled by the council: the declaration
+  carries the type of the related items' `id`, `string`, and no `quantifier`, with `null` as its only
+  operator, which is what the library declares.
 - **`taken` the same for everyone** (5.1): the library asks `taken` before creating, but only the
   adapter can guarantee that the answer does not depend on what the principal sees, and that deleted
   `id`s are remembered.
@@ -491,7 +656,7 @@ item gives `404` (7.2), idempotency without credentials can be rejected with `"a
 ## Code and issues
 
 Code and issues: <https://github.com/restep-spec/restep-server>. That repository is generated from the Restep
-site, where the tool is developed alongside the [specification](https://restep.wubytes.com/1/) and the reference
+site, where the tool is developed alongside the [specification](https://w3id.org/restep/1/) and the reference
 server: `vendor/` and `schema/` are copies from the site so the tests run on their own.
 
 MIT licensed.
